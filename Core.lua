@@ -9,12 +9,17 @@ local UnitLevel = UnitLevel
 local UnitExists = UnitExists
 local UnitClassification = UnitClassification
 local InCombatLockdown = InCombatLockdown
+local SendChatMessage = SendChatMessage
+local IsInGroup = IsInGroup
+local IsInRaid = IsInRaid
+local IsInGuild = IsInGuild
 local tonumber = tonumber
 local wipe = wipe
 local tinsert = table.insert
 local tremove = table.remove
 local format = string.format
 local lower = string.lower
+local upper = string.upper
 local match = string.match
 
 local Addon = {}
@@ -35,6 +40,10 @@ local DEFAULT_DB = {
     showPostCombatBanner = true,
     bossOnly = false,
     debug = false,
+    minimap = {
+        hide = false,
+        angle = 220,
+    },
     thresholds = {
         hoardMultiplier = 2.0,
         hoardHoldSeconds = 1.0,
@@ -138,6 +147,185 @@ function Addon:PrintRescoreSummary(prefixMsg)
     else
         self:Print(prefixMsg .. " (No stored fights to re-score yet.)")
     end
+end
+
+
+
+function Addon:BuildFightDumpText(fight, arg)
+    local targetFight = fight or self:GetLatestFight()
+    if not targetFight then
+        return nil, "No recorded fight to dump. Enter combat first."
+    end
+
+    local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
+    local events = targetFight.events or {}
+    local totalEvents = #events
+    local limit = totalEvents -- Default to full fight in copyable window
+
+    if trimmed ~= "" and trimmed ~= "all" then
+        local parsed = tonumber(trimmed)
+        if parsed and parsed > 0 then
+            limit = math.floor(parsed)
+        else
+            return nil, "Usage: /cte dump [count|all]  (or /cte dump chat [count|all])"
+        end
+    end
+
+    local startIdx = math.max(1, totalEvents - limit + 1)
+    local lines = {}
+
+    local header = format(
+        "CTE Dump | Target: %s | Duration: %.2fs | Class: %s | Score: %s%% | Events: %d (showing %d-%d) | Samples: %d | SecSamples: %d | Overcaps: %d",
+        targetFight.targetName or "Unknown",
+        targetFight.duration or 0,
+        targetFight.playerClass or "?",
+        tostring(targetFight.score or 100),
+        totalEvents,
+        totalEvents > 0 and startIdx or 0,
+        totalEvents,
+        #(targetFight.samples or {}),
+        #(targetFight.secondarySamples or {}),
+        #(targetFight.overcaps or {})
+    )
+    tinsert(lines, header)
+
+    if targetFight.formSegments and #targetFight.formSegments > 0 then
+        local segParts = {}
+        for i = 1, #targetFight.formSegments do
+            local s = targetFight.formSegments[i]
+            tinsert(segParts, format("%s(%.1f-%.1fs)", s.form or "?", s.startTime or 0, s.endTime or targetFight.duration or 0))
+        end
+        tinsert(lines, "Forms: " .. table.concat(segParts, " -> "))
+    end
+
+    if targetFight.totemEvents and #targetFight.totemEvents > 0 then
+        tinsert(lines, format("Totem Events: %d recorded", #targetFight.totemEvents))
+    end
+
+    tinsert(lines, "------------------------------------------------------------------------")
+
+    for i = startIdx, totalEvents do
+        local ev = events[i]
+        local formTag = ev.druidForm and ("[" .. ev.druidForm .. "] ") or ""
+        local secTag = ""
+        if ev.secondaryType ~= nil then
+            secTag = format(" sec=%d/%d", ev.secondaryBefore or 0, ev.secondaryMax or 0)
+        end
+        local burstTag = ((ev.burstSize or 1) > 1) and format(" burst=%d", ev.burstSize) or ""
+        local pressTag = ((ev.pressCount or 1) > 1) and format(" x%d", ev.pressCount) or ""
+        local delta = (ev.powerAfter or 0) - (ev.powerBefore or 0)
+
+        tinsert(lines, format(
+            "#%02d t=%05.2fs | %s%s (id=%d) %s | p%d: %d->%d (d=%+d, cost=%d)%s%s%s | %s",
+            i,
+            ev.t or 0,
+            formTag,
+            ev.spellName or "?",
+            ev.spellID or 0,
+            ev.outcome or "?",
+            ev.powerType or -1,
+            ev.powerBefore or 0,
+            ev.powerAfter or 0,
+            delta,
+            ev.spellCost or 0,
+            secTag,
+            burstTag,
+            pressTag,
+            ev.verdict or "NONE"
+        ))
+    end
+
+    local subtitle = format(
+        "%s (%.1fs) — %d/%d events",
+        targetFight.targetName or "Unknown",
+        targetFight.duration or 0,
+        totalEvents > 0 and (totalEvents - startIdx + 1) or 0,
+        totalEvents
+    )
+    return table.concat(lines, "\n"), subtitle
+end
+
+function Addon:DumpFightTelemetry(arg, fight)
+    local trimmed = match(arg or "", "^%s*(.-)%s*$")
+    local firstToken, rest = match(trimmed, "^(%S+)%s*(.-)$")
+    local toChat = false
+    local countArg = trimmed
+
+    if firstToken and lower(firstToken) == "chat" then
+        toChat = true
+        countArg = (rest ~= "" and rest) or "20"
+    end
+
+    local dumpText, subtitleOrErr = self:BuildFightDumpText(fight, countArg)
+    if not dumpText then
+        self:Print(subtitleOrErr)
+        return
+    end
+
+    if not toChat and NS.UI and NS.UI.ShowDumpWindow then
+        NS.UI:ShowDumpWindow(dumpText, subtitleOrErr)
+        return
+    end
+
+    for line in string.gmatch(dumpText, "[^\n]+") do
+        DEFAULT_CHAT_FRAME:AddMessage("|cffaaaaaa" .. line .. "|r")
+    end
+end
+
+function Addon:ShareFightReport(fight, channel)
+    local targetFight = fight or self:GetLatestFight()
+    if not targetFight then
+        self:Print("No recorded fight available to report.")
+        return false
+    end
+
+    if not NS.Analyzer or not NS.Analyzer.BuildChatReport then
+        self:Print("Analyzer report generator is unavailable.")
+        return false
+    end
+
+    local targetChannel = upper(match(channel or "SELF", "^%s*(.-)%s*$"))
+    if targetChannel == "" or targetChannel == "LOCAL" or targetChannel == "PRINT" then
+        targetChannel = "SELF"
+    end
+
+    if targetChannel == "RAID" then
+        if not (IsInRaid and IsInRaid()) then
+            self:Print("Not in a raid group — printing report to local chat instead.")
+            targetChannel = "SELF"
+        end
+    elseif targetChannel == "PARTY" then
+        if not (IsInGroup and IsInGroup()) then
+            self:Print("Not in a party — printing report to local chat instead.")
+            targetChannel = "SELF"
+        end
+    elseif targetChannel == "GUILD" then
+        if not (IsInGuild and IsInGuild()) then
+            self:Print("Not in a guild — printing report to local chat instead.")
+            targetChannel = "SELF"
+        end
+    elseif targetChannel ~= "SELF" and targetChannel ~= "SAY" then
+        self:Print("Invalid channel. Supported channels: self, party, raid, guild, say.")
+        return false
+    end
+
+    local useColor = (targetChannel == "SELF")
+    local lines = NS.Analyzer:BuildChatReport(targetFight, useColor)
+    if not lines or #lines == 0 then
+        self:Print("Could not generate report for this encounter.")
+        return false
+    end
+
+    if targetChannel == "SELF" then
+        for i = 1, #lines do
+            DEFAULT_CHAT_FRAME:AddMessage(lines[i])
+        end
+    else
+        for i = 1, #lines do
+            SendChatMessage(lines[i], targetChannel)
+        end
+    end
+    return true
 end
 
 function Addon:CheckBossEngagement(unit, explicitBossName)
@@ -322,6 +510,18 @@ function Addon:HandleSlashCommand(input)
                 self:Print("No fights recorded yet. Enter combat to begin recording.")
             end
         end
+    elseif cmd == "report" or cmd == "share" then
+        local ch = (rest ~= "" and rest) or "SELF"
+        self:ShareFightReport(nil, ch)
+    elseif cmd == "minimap" or cmd == "icon" then
+        self.db.minimap.hide = not self.db.minimap.hide
+        if NS.UI and NS.UI.UpdateMinimapButton then
+            NS.UI:UpdateMinimapButton()
+        end
+        if NS.UI and NS.UI.Refresh then
+            NS.UI:Refresh()
+        end
+        self:Print("Minimap button: " .. (self.db.minimap.hide and "|cffaaaaaaHIDDEN|r" or "|cff2ed16bSHOWN|r"))
     elseif cmd == "mult" or cmd == "multiplier" or cmd == "hoardmult" then
         self:HandleMultiplierCommand(rest)
     elseif cmd == "hold" or cmd == "holdsec" or cmd == "hoardhold" then
@@ -336,6 +536,8 @@ function Addon:HandleSlashCommand(input)
         self:PrintRescoreSummary("Manual re-analysis complete.")
     elseif cmd == "clear" or cmd == "reset" then
         self:ClearHistory()
+    elseif cmd == "dump" or cmd == "raw" then
+        self:DumpFightTelemetry(rest)
     elseif cmd == "debug" then
         self.db.debug = not self.db.debug
         self:Print("Debug logging: " .. (self.db.debug and "ON" or "OFF"))
@@ -350,7 +552,7 @@ function Addon:HandleSlashCommand(input)
             self.db.thresholds.hoardHoldSeconds
         ))
     else
-        self:Print("Commands: /cte | /cte mult <1.0-5.0> | /cte hold <0.0-10.0> | /cte boss | /cte rescore | /cte clear")
+        self:Print("Commands: /cte | /cte report [self|party|raid|guild|say] | /cte dump [count|all] | /cte minimap | /cte mult <1.0-5.0> | /cte hold <0.0-10.0> | /cte boss | /cte rescore | /cte clear")
     end
 end
 
@@ -372,6 +574,10 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2)
 
         if NS.Collector and NS.Collector.Init then
             NS.Collector:Init()
+        end
+
+        if NS.UI and NS.UI.InitMinimapButton then
+            NS.UI:InitMinimapButton()
         end
 
         SLASH_COMBATTELEMETRYEFFICIENCY1 = "/cte"

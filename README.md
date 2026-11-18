@@ -2,39 +2,19 @@
 
 Passive post-combat rotation and resource efficiency analyzer built for **World of Warcraft: Forever** (`1.60.1` / `Interface: 16001`).
 
-Instead of flashing prescriptive rotation prompts mid-combat, **CombatTelemetryEfficiency** acts as a zero-clutter flight-data recorder during fights and generates an interactive, zoomable timeline review once combat ends.
+- **GitHub Repository:** https://github.com/foxfair/combat-telemetry-efficiency
+- **CurseForge Project ID:** `1815218` (https://www.curseforge.com/wow/addons/combattelemetryefficiency)
 
 ---
 
 ## Features
 
-- **Zero Mid-Combat Interference:** Renders nothing while in combat (`PLAYER_REGEN_DISABLED`); opens a subtle dismissible review pill or `/cte` window after combat ends (`PLAYER_REGEN_ENABLED`).
-- **15ms Macro Burst & Level-Locked Spell Filtering:**
-  - Discards level-locked or untalented spells inside leveling macros before resource checks run.
-  - Clusters multi-line `/cast` macro bursts within `15ms` into vertical `[M]` icon stacks and suppresses false errors when a fallback line succeeds.
-- **Objective Resource Verdicts:**
-  - **`EFFICIENT` (Green):** Clean spend or generator cast.
-  - **`EARLY_STARVED` (Red):** Keypress attempted without enough resource (collapses rapid GCD spam within `400ms` into an `xN` badge).
-  - **`LATE_HOARD` (Amber):** Resource held at or above `2.0x` primary spender cost past the configured grace period while spenders were usable.
-  - **`OVERCAP_WASTE` (Purple):** Wasted `SPELL_ENERGIZE` ticks at `100%`, `5/5 Combo Point` builder overcaps, or early Shaman totem clipping.
-- **Dual-Resource & Multi-Form Support Across All 9 WoW Forever Classes:**
-  - **Druid:** Tracks `Bear Form` (Rage + backup Mana), `Cat Form` (Energy + Combo Points + `[PS]` powershift tagging), `Moonkin Form`, and `Caster Form` with a color-coded Stance Ribbon.
-  - **Hunter:** Evaluates player Mana shots/traps alongside Pet Focus (`UnitPower("pet", 2)`), pet casts, and pet uptime %.
-  - **Rogue:** Tracks Energy pooling (`90` threshold) alongside a `1–5` Combo Point strip and `5/5 CP` builder overcap detection.
-  - **Shaman:** Tracks Mana alongside 4 elemental totem lanes (`Fire`, `Earth`, `Water`, `Air`) via `PLAYER_TOTEM_UPDATE`.
-  - **Warrior, Paladin, Priest, Mage, Warlock:** Tailored Rage and Mana overcap/starvation analysis without penalizing intentional Mana conservation.
-
----
-
-## Installation (WoW Forever `1.60.1`)
-
-1. Download the latest `CombatTelemetryEfficiency-vX.Y.Z.zip` from [GitHub Releases](https://github.com/foxfair/combat-telemetry-efficiency/releases) or clone this repository.
-2. Extract the `CombatTelemetryEfficiency` folder into:
-   ```text
-   <WoW Forever Directory>/Interface/AddOns/CombatTelemetryEfficiency
-   ```
-3. Verify `CombatTelemetryEfficiency.toc` sits directly inside `Interface/AddOns/CombatTelemetryEfficiency/`.
-4. Enable **CombatTelemetryEfficiency** on the character select AddOns screen (`Interface: 16001`).
+- **Zero Mid-Combat Interference:** Renders nothing while in combat (`PLAYER_REGEN_DISABLED`); opens a dismissible review pill, minimap button, or `/cte` window after combat ends (`PLAYER_REGEN_ENABLED`).
+- **Post-Fight Chat Report Export:** Click **`Report`** in the header (or run `/cte report [self|party|raid|guild|say]`) to post a concise efficiency summary and the top 3 recurring resource improvements to chat.
+- **Draggable Minimap Button:** Left-click to toggle the timeline review window, right-click to open threshold settings, or drag around the minimap edge (angle persisted in `CombatTelemetryEfficiencyDB.minimap.angle`).
+- **15ms Macro Burst & Level-Locked Spell Filtering:** Discards unlearned/level-locked macro lines and clusters simultaneous macro casts within `15ms` into vertical `[M]` stacks.
+- **Objective Resource Verdicts:** Classifies casts into `EFFICIENT`, `EARLY_STARVED` (with `xN` spam collapse), `LATE_HOARD`, and `OVERCAP_WASTE`.
+- **Dual-Resource & Multi-Form Support Across All 9 WoW Forever Classes:** Druid (Bear/Cat/Moonkin/Caster stance ribbon + powershift detection), Hunter (Mana + Pet Focus & uptime), Rogue (Energy + Combo Points), Shaman (Mana + 4 elemental totem tracks), and Warrior/Paladin/Priest/Mage/Warlock.
 
 ---
 
@@ -43,11 +23,12 @@ Instead of flashing prescriptive rotation prompts mid-combat, **CombatTelemetryE
 | Command | Description |
 | :--- | :--- |
 | `/cte` | Toggle the post-combat timeline review window. |
+| `/cte report [self\|party\|raid\|guild\|say]` | Share the latest encounter score and top 3 resource improvements to chat. |
+| `/cte minimap` | Show or hide the draggable minimap button. |
 | `/cte mult <1.0-5.0 \| default>` | Set the `hoardMultiplier` threshold (`2.0x` default) and re-score stored fights. |
 | `/cte hold <0.0-10.0 \| default>` | Set the `hoardHoldSeconds` grace window (`1.0s` default) and re-score stored fights. |
 | `/cte boss` | Toggle Boss-Only recording mode (ignores non-boss trash pulls). |
 | `/cte rescore` | Re-run analysis across all stored encounters using current thresholds. |
+| `/cte dump [count\|all]` | Open a scrollable, copyable (`Ctrl+C`) popup window with raw timestamps, spell IDs, resource deltas, and verdicts. Use `/cte dump chat [count]` to print to chat instead. |
 | `/cte status` | Display combat state, saved fight count, and active threshold settings. |
 | `/cte clear` | Clear all saved encounter history from `CombatTelemetryEfficiencyDB`. |
-
-You can also click **`Settings`** in the top-right header of the `/cte` window to adjust sliders and toggles live.

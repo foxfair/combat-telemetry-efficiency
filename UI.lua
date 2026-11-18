@@ -2,14 +2,22 @@ local _, NS = ...
 
 local CreateFrame = CreateFrame
 local GetTime = GetTime
+local GetCursorPosition = GetCursorPosition
 local GameTooltip = GameTooltip
 local UIParent = UIParent
+local Minimap = Minimap
+local GetMinimapShape = GetMinimapShape
 local tinsert = table.insert
 local wipe = wipe
 local max = math.max
 local min = math.min
 local floor = math.floor
 local abs = math.abs
+local atan2 = math.atan2
+local cos = math.cos
+local sin = math.sin
+local deg = math.deg
+local rad = math.rad
 local format = string.format
 
 local UI = {}
@@ -17,13 +25,15 @@ NS.UI = UI
 
 local BACKDROP_TEMPLATE = BackdropTemplateMixin and "BackdropTemplate" or nil
 
-local WINDOW_WIDTH = 812
+local WINDOW_WIDTH = 856
 local WINDOW_HEIGHT = 496
 local BAND1_HEIGHT = 32
 local BAND2_HEIGHT = 198
 local LOG_ROW_HEIGHT = 22
 local VISIBLE_LOG_ROWS = 7
 local CURVE_SLICES = 150
+local MINIMAP_RADIUS = 80
+local DEFAULT_MINIMAP_ANGLE = 220
 
 local SECONDARY = {
     COMBO_POINTS = 4,
@@ -32,6 +42,7 @@ local SECONDARY = {
     TOTEM_SLOTS = 104,
 }
 
+local MINIMAP_BUTTON_ICON = "Interface\Icons\INV_Misc_PocketWatch_01"
 local OVERCAP_FALLBACK_ICON = "Interface\Icons\Spell_Nature_WispSplode"
 local DEFAULT_SPELL_ICON = "Interface\Icons\INV_Misc_QuestionMark"
 
@@ -90,10 +101,13 @@ local TOTEM_SLOT_COLORS = {
     [4] = { 0.65, 0.88, 1.00 },
 }
 
+local minimapButton = nil
 local pillFrame = nil
 local mainFrame = nil
 local fightMenuFrame = nil
 local settingsPopover = nil
+local reportPopover = nil
+local dumpFrame = nil
 local isSyncingSettings = false
 local selectedFightIndex = 1
 local viewLayerMode = "DUAL"
@@ -113,10 +127,6 @@ local axisLabelPool = {}
 local pinPool = {}
 local logRowPool = {}
 local filteredEvents = {}
-
-------------------------------------------------------------------------
--- Formatting, Backdrop & Widget Primitives
-------------------------------------------------------------------------
 
 local function FormatClock(sec)
     sec = max(0, sec or 0)
@@ -297,9 +307,166 @@ local function CreateCompactCheckbox(parent, width, labelText, subText, onToggle
     return btn
 end
 
-------------------------------------------------------------------------
--- Settings Popover
-------------------------------------------------------------------------
+local function UpdateMinimapButtonPosition()
+    if not minimapButton or not Minimap then
+        return
+    end
+
+    local angleDeg = DEFAULT_MINIMAP_ANGLE
+    if NS.Addon and NS.Addon.db and NS.Addon.db.minimap and type(NS.Addon.db.minimap.angle) == "number" then
+        angleDeg = NS.Addon.db.minimap.angle
+    end
+
+    local angleRad = rad(angleDeg)
+    local x = cos(angleRad) * MINIMAP_RADIUS
+    local y = sin(angleRad) * MINIMAP_RADIUS
+
+    if GetMinimapShape and GetMinimapShape() == "SQUARE" then
+        x = max(-MINIMAP_RADIUS, min(MINIMAP_RADIUS, cos(angleRad) * MINIMAP_RADIUS * 1.35))
+        y = max(-MINIMAP_RADIUS, min(MINIMAP_RADIUS, sin(angleRad) * MINIMAP_RADIUS * 1.35))
+    end
+
+    minimapButton:ClearAllPoints()
+    minimapButton:SetPoint("CENTER", Minimap, "CENTER", x, y)
+end
+
+function UI:UpdateMinimapButton()
+    if not minimapButton then
+        return
+    end
+    UpdateMinimapButtonPosition()
+    local hidden = NS.Addon and NS.Addon.db and NS.Addon.db.minimap and NS.Addon.db.minimap.hide
+    if hidden then
+        minimapButton:Hide()
+    else
+        minimapButton:Show()
+    end
+end
+
+function UI:InitMinimapButton()
+    if minimapButton or not Minimap then
+        self:UpdateMinimapButton()
+        return
+    end
+
+    local btn = CreateFrame("Button", "CombatTelemetryEfficiencyMinimapButton", Minimap)
+    btn:SetSize(32, 32)
+    btn:SetFrameStrata("MEDIUM")
+    btn:SetFrameLevel(8)
+    btn:SetMovable(true)
+    btn:EnableMouse(true)
+    btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    btn:RegisterForDrag("LeftButton")
+
+    local bg = btn:CreateTexture(nil, "BACKGROUND")
+    bg:SetSize(20, 20)
+    bg:SetPoint("CENTER", 0, 1)
+    bg:SetTexture("Interface\Minimap\UI-Minimap-Background")
+
+    local icon = btn:CreateTexture(nil, "ARTWORK")
+    icon:SetSize(18, 18)
+    icon:SetPoint("CENTER", 0, 1)
+    icon:SetTexture(MINIMAP_BUTTON_ICON)
+    icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    btn.icon = icon
+
+    local border = btn:CreateTexture(nil, "OVERLAY")
+    border:SetSize(54, 54)
+    border:SetPoint("TOPLEFT", 0, 0)
+    border:SetTexture("Interface\Minimap\MiniMap-TrackingBorder")
+
+    local hl = btn:CreateTexture(nil, "HIGHLIGHT")
+    hl:SetSize(24, 24)
+    hl:SetPoint("CENTER", 0, 1)
+    hl:SetTexture("Interface\Minimap\UI-Minimap-ZoomButton-Highlight")
+    hl:SetBlendMode("ADD")
+
+    btn.isDragging = false
+
+    btn:SetScript("OnDragStart", function(self)
+        self.isDragging = true
+        self:LockHighlight()
+        GameTooltip:Hide()
+    end)
+
+    btn:SetScript("OnDragStop", function(self)
+        self.isDragging = false
+        self:UnlockHighlight()
+    end)
+
+    btn:SetScript("OnHide", function(self)
+        self.isDragging = false
+    end)
+
+    btn:SetScript("OnUpdate", function(self)
+        if not self.isDragging then
+            return
+        end
+        local mx, my = Minimap:GetCenter()
+        if not mx or not my then
+            return
+        end
+        local cx, cy = GetCursorPosition()
+        local scale = Minimap:GetEffectiveScale()
+        cx = cx / scale
+        cy = cy / scale
+
+        local angleDeg = deg(atan2(cy - my, cx - mx))
+        if angleDeg < 0 then
+            angleDeg = angleDeg + 360
+        end
+
+        if NS.Addon and NS.Addon.db then
+            if type(NS.Addon.db.minimap) ~= "table" then
+                NS.Addon.db.minimap = {}
+            end
+            NS.Addon.db.minimap.angle = angleDeg
+        end
+        UpdateMinimapButtonPosition()
+    end)
+
+    btn:SetScript("OnEnter", function(self)
+        if self.isDragging then
+            return
+        end
+        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+        GameTooltip:AddLine("|cff5cc8ffCombatTelemetryEfficiency|r", 1, 1, 1)
+
+        local latest = NS.Addon and NS.Addon.GetLatestFight and NS.Addon:GetLatestFight()
+        if latest then
+            local score = latest.score or 100
+            local scoreHex = (score >= 88 and "|cff2ed16b") or (score >= 70 and "|cfff5ad24") or "|cfff04047"
+            GameTooltip:AddDoubleLine(
+                "Latest Encounter:",
+                format("%s (%s%d%%|r)", latest.targetName or "Encounter", scoreHex, score),
+                0.75, 0.80, 0.86, 1, 1, 1
+            )
+        else
+            GameTooltip:AddLine("No encounters recorded yet.", 0.65, 0.70, 0.76)
+        end
+
+        GameTooltip:AddLine(" ")
+        GameTooltip:AddLine("|cff2ed16bLeft-Click:|r Toggle Review Window", 0.85, 0.88, 0.92)
+        GameTooltip:AddLine("|cff66d9ffRight-Click:|r Threshold Settings", 0.85, 0.88, 0.92)
+        GameTooltip:AddLine("|cffaaaaaaDrag:|r Move Around Minimap", 0.75, 0.78, 0.82)
+        GameTooltip:Show()
+    end)
+
+    btn:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+
+    btn:SetScript("OnClick", function(_, button)
+        if button == "RightButton" then
+            UI:OpenSettings()
+        else
+            UI:Toggle()
+        end
+    end)
+
+    minimapButton = btn
+    self:UpdateMinimapButton()
+end
 
 local function SyncSettingsPopover()
     if not settingsPopover or not NS.Addon or not NS.Addon.db then
@@ -311,13 +478,14 @@ local function SyncSettingsPopover()
     settingsPopover.holdSlider:SetDisplayValue(db.thresholds.hoardHoldSeconds or 1.0)
     settingsPopover.bannerCheck:SetCheckedState(db.showPostCombatBanner ~= false)
     settingsPopover.bossCheck:SetCheckedState(db.bossOnly == true)
+    settingsPopover.minimapCheck:SetCheckedState(not (db.minimap and db.minimap.hide))
     isSyncingSettings = false
 end
 
 local function ToggleSettingsPopover(anchor)
     if not settingsPopover then
         local pop = CreateFrame("Frame", nil, mainFrame, BACKDROP_TEMPLATE)
-        pop:SetSize(264, 238)
+        pop:SetSize(264, 264)
         pop:SetFrameStrata("FULLSCREEN_DIALOG")
         pop:EnableMouse(true)
         ApplyPanelBackdrop(pop, 0.98, 0.34, 0.66, 0.94, 1.0)
@@ -410,6 +578,21 @@ local function ToggleSettingsPopover(anchor)
         bossCheck:SetPoint("TOPLEFT", bannerCheck, "BOTTOMLEFT", 0, -6)
         pop.bossCheck = bossCheck
 
+        local minimapCheck = CreateCompactCheckbox(
+            pop,
+            238,
+            "Show Minimap Button",
+            nil,
+            function(checked)
+                if NS.Addon and NS.Addon.db then
+                    NS.Addon.db.minimap.hide = not checked
+                    UI:UpdateMinimapButton()
+                end
+            end
+        )
+        minimapCheck:SetPoint("TOPLEFT", bossCheck, "BOTTOMLEFT", 0, -6)
+        pop.minimapCheck = minimapCheck
+
         local resetBtn = CreateActionButton(pop, 114, 22, "Reset Defaults")
         resetBtn:SetPoint("BOTTOMRIGHT", pop, "BOTTOMRIGHT", -12, 10)
         resetBtn:SetScript("OnClick", function()
@@ -419,6 +602,9 @@ local function ToggleSettingsPopover(anchor)
                 NS.Addon.db.thresholds.hoardHoldSeconds = defs and defs.thresholds.hoardHoldSeconds or 1.0
                 NS.Addon.db.showPostCombatBanner = true
                 NS.Addon.db.bossOnly = false
+                NS.Addon.db.minimap.hide = false
+                NS.Addon.db.minimap.angle = DEFAULT_MINIMAP_ANGLE
+                UI:UpdateMinimapButton()
                 SyncSettingsPopover()
                 NS.Addon:ReanalyzeAllFights()
             end
@@ -436,6 +622,12 @@ local function ToggleSettingsPopover(anchor)
     if fightMenuFrame and fightMenuFrame:IsShown() then
         fightMenuFrame:Hide()
     end
+    if reportPopover and reportPopover:IsShown() then
+        reportPopover:Hide()
+        if mainFrame and mainFrame.reportBtn then
+            mainFrame.reportBtn:SetActiveState(false)
+        end
+    end
 
     SyncSettingsPopover()
     settingsPopover:ClearAllPoints()
@@ -443,10 +635,6 @@ local function ToggleSettingsPopover(anchor)
     settingsPopover:Show()
     anchor:SetActiveState(true)
 end
-
-------------------------------------------------------------------------
--- Data Filtering, Stance & Viewport Math
-------------------------------------------------------------------------
 
 local function GetActiveFight()
     local fights = NS.Addon and NS.Addon.db and NS.Addon.db.fights
@@ -457,6 +645,88 @@ local function GetActiveFight()
         selectedFightIndex = 1
     end
     return fights[selectedFightIndex]
+end
+
+
+local REPORT_CHANNELS = {
+    { key = "SELF",  label = "Self (Local Chat)" },
+    { key = "PARTY", label = "Party Chat (/p)" },
+    { key = "RAID",  label = "Raid Chat (/ra)" },
+    { key = "GUILD", label = "Guild Chat (/g)" },
+    { key = "SAY",   label = "Say (/s)" },
+    { key = "DUMP",  label = "Raw Telemetry (Copy)" },
+}
+
+local function ToggleReportPopover(anchor)
+    if not reportPopover then
+        local pop = CreateFrame("Frame", nil, mainFrame, BACKDROP_TEMPLATE)
+        local itemH = 22
+        pop:SetSize(156, (#REPORT_CHANNELS * itemH) + 28)
+        pop:SetFrameStrata("FULLSCREEN_DIALOG")
+        pop:EnableMouse(true)
+        ApplyPanelBackdrop(pop, 0.98, 0.34, 0.66, 0.94, 1.0)
+        pop:Hide()
+
+        local header = pop:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        header:SetPoint("TOPLEFT", pop, "TOPLEFT", 8, -7)
+        header:SetText("|cff5cc8ffShare Fight Report|r")
+
+        for i = 1, #REPORT_CHANNELS do
+            local ch = REPORT_CHANNELS[i]
+            local item = CreateFrame("Button", nil, pop)
+            item:SetHeight(itemH)
+            item:SetPoint("TOPLEFT", pop, "TOPLEFT", 4, -22 - ((i - 1) * itemH))
+            item:SetPoint("TOPRIGHT", pop, "TOPRIGHT", -4, -22 - ((i - 1) * itemH))
+
+            local hl = item:CreateTexture(nil, "HIGHLIGHT")
+            hl:SetAllPoints()
+            hl:SetColorTexture(0.25, 0.52, 0.82, 0.45)
+
+            local txt = item:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            txt:SetPoint("LEFT", 6, 0)
+            txt:SetPoint("RIGHT", -6, 0)
+            txt:SetJustifyH("LEFT")
+            txt:SetTextColor(0.90, 0.93, 0.96)
+            txt:SetText(ch.label)
+
+            item:SetScript("OnClick", function()
+                pop:Hide()
+                if mainFrame and mainFrame.reportBtn then
+                    mainFrame.reportBtn:SetActiveState(false)
+                end
+                if ch.key == "DUMP" then
+                    if NS.Addon and NS.Addon.DumpFightTelemetry then
+                        NS.Addon:DumpFightTelemetry("all", GetActiveFight())
+                    end
+                elseif NS.Addon and NS.Addon.ShareFightReport then
+                    NS.Addon:ShareFightReport(GetActiveFight(), ch.key)
+                end
+            end)
+        end
+
+        reportPopover = pop
+    end
+
+    if reportPopover:IsShown() then
+        reportPopover:Hide()
+        anchor:SetActiveState(false)
+        return
+    end
+
+    if fightMenuFrame and fightMenuFrame:IsShown() then
+        fightMenuFrame:Hide()
+    end
+    if settingsPopover and settingsPopover:IsShown() then
+        settingsPopover:Hide()
+        if mainFrame and mainFrame.settingsBtn then
+            mainFrame.settingsBtn:SetActiveState(false)
+        end
+    end
+
+    reportPopover:ClearAllPoints()
+    reportPopover:SetPoint("TOPRIGHT", anchor, "BOTTOMRIGHT", 0, -3)
+    reportPopover:Show()
+    anchor:SetActiveState(true)
 end
 
 local function RebuildFilteredEvents(fight)
@@ -555,10 +825,6 @@ local function SampleSecondaryAtTime(secSamples, secType, t)
     return lastVal or 0, lastMax, lastExtra
 end
 
-------------------------------------------------------------------------
--- Post-Combat Notification Pill
-------------------------------------------------------------------------
-
 local function EnsureNotificationPill()
     if pillFrame then
         return pillFrame
@@ -646,10 +912,6 @@ function UI:ShowPostCombatPill(fight)
     pill:Show()
 end
 
-------------------------------------------------------------------------
--- Band 1: Overview Scrub & Zoom Bar
-------------------------------------------------------------------------
-
 local function RenderBand1(fight)
     local band = mainFrame.band1
     for i = 1, #scrubTickPool do
@@ -695,10 +957,6 @@ local function RenderBand1(fight)
     band.viewport:SetSize(boxWidth, height)
     band.viewport:Show()
 end
-
-------------------------------------------------------------------------
--- Band 2: Dual-Resource Sparkline, Form Ribbon, Totem Tracks & Pins
-------------------------------------------------------------------------
 
 local function HighlightEventSync(eventIndex, shouldScrollLog)
     highlightedEventIndex = eventIndex
@@ -1252,10 +1510,6 @@ local function RenderBand2(fight)
     end
 end
 
-------------------------------------------------------------------------
--- Band 3: Synchronized Step Log
-------------------------------------------------------------------------
-
 local function RenderBand3(fight)
     local band3 = mainFrame.band3
     local scrollFrame = band3.scrollFrame
@@ -1406,10 +1660,6 @@ local function RenderBand3(fight)
     end
 end
 
-------------------------------------------------------------------------
--- Full Window Refresh & Fight Dropdown
-------------------------------------------------------------------------
-
 function UI:Refresh()
     if not mainFrame or not mainFrame:IsShown() then
         return
@@ -1522,6 +1772,12 @@ local function ToggleFightDropdown(anchor)
             mainFrame.settingsBtn:SetActiveState(false)
         end
     end
+    if reportPopover and reportPopover:IsShown() then
+        reportPopover:Hide()
+        if mainFrame and mainFrame.reportBtn then
+            mainFrame.reportBtn:SetActiveState(false)
+        end
+    end
 
     local fights = (NS.Addon and NS.Addon.db and NS.Addon.db.fights) or {}
     if #fights == 0 then
@@ -1579,10 +1835,6 @@ local function ToggleFightDropdown(anchor)
     fightMenuFrame:Show()
 end
 
-------------------------------------------------------------------------
--- Main Review Frame Construction
-------------------------------------------------------------------------
-
 local function EnsureMainFrame()
     if mainFrame then
         return mainFrame
@@ -1604,8 +1856,14 @@ local function EnsureMainFrame()
         if settingsPopover then
             settingsPopover:Hide()
         end
+        if reportPopover then
+            reportPopover:Hide()
+        end
         if f.settingsBtn then
             f.settingsBtn:SetActiveState(false)
+        end
+        if f.reportBtn then
+            f.reportBtn:SetActiveState(false)
         end
     end)
     ApplyPanelBackdrop(f, 0.96, 0.26, 0.30, 0.36, 1.0)
@@ -1692,11 +1950,17 @@ local function EnsureMainFrame()
     end)
     f.settingsBtn = settingsBtn
 
+    local reportBtn = CreateActionButton(f, 54, 22, "Report")
+    reportBtn:SetPoint("RIGHT", settingsBtn, "LEFT", -6, 0)
+    reportBtn:SetScript("OnClick", function(self)
+        ToggleReportPopover(self)
+    end)
+    f.reportBtn = reportBtn
+
     local summaryText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     summaryText:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -36)
     f.summaryText = summaryText
 
-    -- BAND 1: Overview Scrub Bar
     local band1 = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
     band1:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -54)
     band1:SetPoint("TOPRIGHT", f, "TOPRIGHT", -12, -54)
@@ -1759,7 +2023,6 @@ local function EnsureMainFrame()
         RenderBand2(fight)
     end)
 
-    -- BAND 2: Resource Sparkline, Form Ribbon & Dual-Resource Overlay
     local band2 = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
     band2:SetPoint("TOPLEFT", band1, "BOTTOMLEFT", 0, -6)
     band2:SetPoint("TOPRIGHT", band1, "BOTTOMRIGHT", 0, -6)
@@ -1808,7 +2071,6 @@ local function EnsureMainFrame()
         UI:Refresh()
     end)
 
-    -- BAND 3: Synchronized Step Log
     local band3 = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
     band3:SetPoint("TOPLEFT", band2, "BOTTOMLEFT", 0, -6)
     band3:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 10)
@@ -1867,10 +2129,6 @@ local function EnsureMainFrame()
     return f
 end
 
-------------------------------------------------------------------------
--- Public UI API
-------------------------------------------------------------------------
-
 function UI:Show()
     local f = EnsureMainFrame()
     selectedFightIndex = 1
@@ -1895,6 +2153,18 @@ function UI:Toggle()
     end
 end
 
+function UI:OpenSettings()
+    local f = EnsureMainFrame()
+    if not f:IsShown() then
+        self:Show()
+    end
+    if f.settingsBtn then
+        if not settingsPopover or not settingsPopover:IsShown() then
+            ToggleSettingsPopover(f.settingsBtn)
+        end
+    end
+end
+
 function UI:OnFightRecorded(fight)
     if NS.Addon and NS.Addon.db and NS.Addon.db.showPostCombatBanner then
         self:ShowPostCombatPill(fight)
@@ -1905,4 +2175,103 @@ function UI:OnFightRecorded(fight)
         SetViewportRange(fight, 0, 1)
         self:Refresh()
     end
+end
+
+------------------------------------------------------------------------
+-- Copyable Raw Telemetry Dump Popup (/cte dump)
+------------------------------------------------------------------------
+
+local function EnsureDumpFrame()
+    if dumpFrame then
+        return dumpFrame
+    end
+
+    local f = CreateFrame("Frame", "CombatTelemetryEfficiencyDumpFrame", UIParent, BACKDROP_TEMPLATE)
+    f:SetSize(660, 430)
+    f:SetPoint("CENTER")
+    f:SetFrameStrata("FULLSCREEN_DIALOG")
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    ApplyPanelBackdrop(f, 0.97, 0.32, 0.64, 0.92, 1.0)
+    f:Hide()
+
+    tinsert(UISpecialFrames, "CombatTelemetryEfficiencyDumpFrame")
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -12)
+    title:SetText("|cff5cc8ffCTE Raw Telemetry Dump|r")
+
+    local subtitle = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    subtitle:SetPoint("LEFT", title, "RIGHT", 10, 0)
+    subtitle:SetTextColor(0.72, 0.78, 0.85)
+    f.subtitle = subtitle
+
+    local closeBtn = CreateActionButton(f, 22, 22, "X")
+    closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -10, -9)
+    closeBtn:SetScript("OnClick", function()
+        f:Hide()
+    end)
+
+    local selectAllBtn = CreateActionButton(f, 82, 22, "Select All")
+    selectAllBtn:SetPoint("RIGHT", closeBtn, "LEFT", -6, 0)
+    selectAllBtn:SetScript("OnClick", function()
+        f.editBox:SetFocus()
+        f.editBox:HighlightText()
+    end)
+
+    local hint = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    hint:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -34)
+    hint:SetTextColor(0.58, 0.64, 0.72)
+    hint:SetText("Press Ctrl+C to copy selected telemetry (or click Select All). Press Esc to close.")
+
+    local boxContainer = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
+    boxContainer:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -52)
+    boxContainer:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 12)
+    ApplyPanelBackdrop(boxContainer, 0.96, 0.20, 0.23, 0.28, 1.0)
+
+    local scrollFrame = CreateFrame("ScrollFrame", "CombatTelemetryEfficiencyDumpScroll", boxContainer, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", boxContainer, "TOPLEFT", 6, -6)
+    scrollFrame:SetPoint("BOTTOMRIGHT", boxContainer, "BOTTOMRIGHT", -26, 6)
+    f.scrollFrame = scrollFrame
+
+    local editBox = CreateFrame("EditBox", nil, scrollFrame)
+    editBox:SetMultiLine(true)
+    editBox:SetAutoFocus(false)
+    editBox:SetFontObject(GameFontHighlightSmall)
+    editBox:SetWidth(600)
+    editBox:SetTextInsets(4, 4, 4, 4)
+    editBox:SetScript("OnEscapePressed", function()
+        f:Hide()
+    end)
+    editBox:SetScript("OnTextChanged", function(self)
+        local text = self:GetText() or ""
+        local lineCount = 1
+        for _ in string.gmatch(text, "\n") do
+            lineCount = lineCount + 1
+        end
+        self:SetHeight(max(340, lineCount * 15 + 24))
+    end)
+    scrollFrame:SetScrollChild(editBox)
+    f.editBox = editBox
+
+    boxContainer:EnableMouse(true)
+    boxContainer:SetScript("OnMouseDown", function()
+        editBox:SetFocus()
+    end)
+
+    dumpFrame = f
+    return f
+end
+
+function UI:ShowDumpWindow(text, subtitleText)
+    local f = EnsureDumpFrame()
+    f.subtitle:SetText(subtitleText or "")
+    f.editBox:SetText(text or "")
+    f.scrollFrame:SetVerticalScroll(0)
+    f:Show()
+    f.editBox:SetFocus()
+    f.editBox:HighlightText()
 end
