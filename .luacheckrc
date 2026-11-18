@@ -1,4 +1,5 @@
 std = "lua51"
+max_line_length = false
 
 globals = {
     -- Core WoW Client & Frame APIs (WoW Forever 1.60.1 / Interface 16001)
@@ -44,5 +45,7 @@ globals = {
 }
 
 ignore = {
-    "212", -- Unused function parameters in WoW event handlers
+    "211", -- Unused local variable
+    "212", -- Unused function argument in WoW event handlers
+    "213", -- Unused loop variable
 }

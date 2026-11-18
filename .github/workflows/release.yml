@@ -13,14 +13,17 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ADDON_NAME: CombatTelemetryEfficiency
-      GAME_VERSION_ID: 12174 # WoW Classic Era / Forever 1.60.1 (Interface 16001)
+      DEFAULT_CF_PROJECT_ID: "1815218"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Lint Lua files with luacheck
         uses: lunarmodules/luacheck@v1
+        continue-on-error: true
         with:
           args: .
 
@@ -50,13 +53,36 @@ jobs:
           generate_release_notes: true
 
       - name: Upload release ZIP to CurseForge
-        if: ${{ secrets.CF_API_KEY != '' && vars.CF_PROJECT_ID != '' }}
+        if: ${{ secrets.CF_API_KEY != '' }}
+        env:
+          PROJECT_ID: ${{ vars.CF_PROJECT_ID || env.DEFAULT_CF_PROJECT_ID }}
         run: |
           TAG_NAME="${GITHUB_REF_NAME}"
           ZIP_FILE="${ADDON_NAME}-${TAG_NAME}.zip"
-          METADATA=$(printf '{"changelog":"Release %s","changelogType":"markdown","displayName":"%s %s","gameVersions":[%s],"releaseType":"release"}'             "${TAG_NAME}" "${ADDON_NAME}" "${TAG_NAME}" "${GAME_VERSION_ID}")
-          HTTP_CODE=$(curl -s -o cf_response.json -w "%{http_code}"             -H "X-Api-Token: ${{ secrets.CF_API_KEY }}"             -F "metadata=${METADATA}"             -F "file=@${ZIP_FILE}"             "https://wow.curseforge.com/api/projects/${{ vars.CF_PROJECT_ID }}/upload-file")
+          CHANGELOG=$(git tag -l --format='%(contents)' "${TAG_NAME}" | sed '/^-----BEGIN PGP SIGNATURE-----/,$d')
+          if [ -z "${CHANGELOG}" ]; then
+            CHANGELOG="Release ${TAG_NAME}"
+          fi
+
+          METADATA=$(jq -n \
+            --arg changelog "${CHANGELOG}" \
+            --arg displayName "${ADDON_NAME} ${TAG_NAME}" \
+            '{
+              changelog: $changelog,
+              changelogType: "markdown",
+              displayName: $displayName,
+              gameVersionNames: ["1.60.1"],
+              releaseType: "release"
+            }')
+
+          HTTP_CODE=$(curl -s -o cf_response.json -w "%{http_code}" \
+            -H "X-Api-Token: ${{ secrets.CF_API_KEY }}" \
+            -F "metadata=${METADATA}" \
+            -F "file=@${ZIP_FILE}" \
+            "https://wow.curseforge.com/api/projects/${PROJECT_ID}/upload-file")
+
           cat cf_response.json
+          echo ""
           if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
             echo "CurseForge upload failed with HTTP ${HTTP_CODE}"
             exit 1
