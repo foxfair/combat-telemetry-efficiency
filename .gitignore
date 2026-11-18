@@ -1,0 +1,13 @@
+# OS & Editor Artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Packaged Release Archives
+*.zip
+
+# Local Release Helper Script (kept untracked in public repo)
+release.sh

@@ -1,0 +1,12 @@
+## Interface: 16001
+## Title: CombatTelemetryEfficiency
+## Notes: Passive post-combat rotation and resource efficiency analyzer for WoW Forever
+## Author: foxfair
+## Version: 0.1.0
+## SavedVariables: CombatTelemetryEfficiencyDB
+## X-Curse-Project-ID: 1815218
+
+Core.lua
+Collector.lua
+Analyzer.lua
+UI.lua
