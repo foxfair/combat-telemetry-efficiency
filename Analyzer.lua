@@ -149,10 +149,6 @@ local function MatchesAnyKeyword(spellName, list)
     return false
 end
 
-------------------------------------------------------------------------
--- Primary, Secondary & Multi-Form Calibration
-------------------------------------------------------------------------
-
 local function DeterminePrimaryPowerType(fight)
     local counts = {}
     for i = 1, #fight.events do
@@ -272,10 +268,6 @@ local function ComputeDruidFormBreakdown(fight, summary)
         TRAVEL = floor((totals.TRAVEL / totalDur) * 100 + 0.5),
     }
 end
-
-------------------------------------------------------------------------
--- Sample Window & Overcap Attribution
-------------------------------------------------------------------------
 
 local function ComputeHeldDurationAbove(samples, powerType, windowStart, eventTime, threshold)
     if not samples or #samples == 0 or eventTime <= windowStart then
@@ -430,10 +422,6 @@ local function MergeOvercapsIntoEvents(events, clusters)
     end
 end
 
-------------------------------------------------------------------------
--- Class-Specific Telemetry (Hunter Pet & Shaman Totems)
-------------------------------------------------------------------------
-
 local function AnalyzeHunterPetTelemetry(fight, summary)
     if fight.playerClass ~= "HUNTER" then
         return
@@ -551,10 +539,6 @@ local function AnalyzeShamanTotemTelemetry(fight, summary)
     summary.totemClipCount = clipCount
 end
 
-------------------------------------------------------------------------
--- Score Calculation
-------------------------------------------------------------------------
-
 local function CalculateFightScore(summary, totalSteps)
     if totalSteps <= 0 then
         return 100
@@ -570,10 +554,6 @@ local function CalculateFightScore(summary, totalSteps)
 
     return floor(max(0, min(100, 100 - normalizedDeduction)) + 0.5)
 end
-
-------------------------------------------------------------------------
--- Main Fight Analysis Entry Point
-------------------------------------------------------------------------
 
 function Analyzer:AnalyzeFight(fight, customThresholds)
     if not fight or not fight.events then
@@ -851,4 +831,163 @@ function Analyzer:AnalyzeFight(fight, customThresholds)
     fight.summary = summary
     fight.score = CalculateFightScore(summary, totalSteps)
     return fight
+end
+
+------------------------------------------------------------------------
+-- Post-Fight Chat Report Generator (Top 3 Resource Improvements)
+------------------------------------------------------------------------
+
+local REPORT_VERDICT_LABEL = {
+    EARLY_STARVED = "Early",
+    LATE_HOARD = "Late",
+    OVERCAP_WASTE = "Overcap",
+}
+
+local REPORT_VERDICT_COLOR = {
+    EARLY_STARVED = "|cfff04047",
+    LATE_HOARD = "|cfff5ad24",
+    OVERCAP_WASTE = "|cffd159eb",
+}
+
+local function FormatReportClock(sec)
+    sec = max(0, sec or 0)
+    local mins = floor(sec / 60)
+    local rem = floor(sec % 60)
+    return format("%d:%02d", mins, rem)
+end
+
+function Analyzer:BuildChatReport(fight, useColor)
+    if not fight then
+        return {}
+    end
+
+    local sum = fight.summary or {}
+    local score = fight.score or 100
+    local lines = {}
+
+    local extraStat = ""
+    if fight.playerClass == "HUNTER" and sum.petUptimePct ~= nil then
+        extraStat = format(" | Pet Uptime: %d%%", sum.petUptimePct)
+    elseif fight.playerClass == "SHAMAN" and sum.avgActiveTotems ~= nil then
+        extraStat = format(" | Avg Totems: %.1f/4", sum.avgActiveTotems)
+    elseif fight.playerClass == "DRUID" and sum.formBreakdown then
+        local fb = sum.formBreakdown
+        local parts = {}
+        if (fb.CAT or 0) > 0 then tinsert(parts, format("Cat %d%%", fb.CAT)) end
+        if (fb.BEAR or 0) > 0 then tinsert(parts, format("Bear %d%%", fb.BEAR)) end
+        if (fb.MOONKIN or 0) > 0 then tinsert(parts, format("Moon %d%%", fb.MOONKIN)) end
+        if (fb.CASTER or 0) > 0 then tinsert(parts, format("Cast %d%%", fb.CASTER)) end
+        if #parts > 0 then
+            extraStat = " | Forms: " .. table.concat(parts, "/")
+        end
+    end
+
+    if useColor then
+        local scoreHex = (score >= 88 and "|cff2ed16b") or (score >= 70 and "|cfff5ad24") or "|cfff04047"
+        tinsert(lines, format(
+            "|cff5cc8ff[CTE]|r %s (%s) — Score: %s%d%%|r | |cff2ed16b%d Eff|r, |cfff04047%d Early|r, |cfff5ad24%d Late|r, |cffd159eb%d Overcap|r%s",
+            fight.targetName or "Encounter",
+            FormatReportClock(fight.duration),
+            scoreHex,
+            score,
+            sum.efficientCount or 0,
+            sum.earlyStarvedCount or 0,
+            sum.lateHoardCount or 0,
+            sum.overcapWasteCount or 0,
+            extraStat
+        ))
+    else
+        tinsert(lines, format(
+            "[CTE] %s (%s) - Score: %d%% | %d Efficient, %d Early, %d Late, %d Overcap%s",
+            fight.targetName or "Encounter",
+            FormatReportClock(fight.duration),
+            score,
+            sum.efficientCount or 0,
+            sum.earlyStarvedCount or 0,
+            sum.lateHoardCount or 0,
+            sum.overcapWasteCount or 0,
+            extraStat
+        ))
+    end
+
+    local grouped = {}
+    local groupedList = {}
+
+    for i = 1, #(fight.events or {}) do
+        local ev = fight.events[i]
+        if ev.verdict and ev.verdict ~= VERDICTS.EFFICIENT then
+            local spell = ev.spellName or "Ability"
+            local key = ev.verdict .. "::" .. spell
+            local bucket = grouped[key]
+            if not bucket then
+                bucket = {
+                    verdict = ev.verdict,
+                    spellName = spell,
+                    count = 0,
+                    impact = 0,
+                    sampleNote = ev.note or "",
+                    sampleTime = ev.t or 0,
+                }
+                grouped[key] = bucket
+                tinsert(groupedList, bucket)
+            end
+            bucket.count = bucket.count + 1
+
+            local weight = 1.0
+            if ev.verdict == VERDICTS.EARLY_STARVED then
+                weight = 1.3 + (0.2 * min(4, (ev.pressCount or 1) - 1))
+            elseif ev.verdict == VERDICTS.OVERCAP_WASTE then
+                weight = 1.2 + ((ev.wastedAmount or 0) / max(1, ev.powerMax or 100))
+            elseif ev.verdict == VERDICTS.LATE_HOARD then
+                weight = 1.1 + min(1.5, (ev.heldSeconds or 1.0) * 0.35)
+            end
+            bucket.impact = bucket.impact + weight
+        end
+    end
+
+    if #groupedList == 0 then
+        if useColor then
+            tinsert(lines, "|cff2ed16b  Clean fight! No early-starved, late-hoard, or overcap issues detected.|r")
+        else
+            tinsert(lines, "Clean fight! No early-starved, late-hoard, or overcap issues detected.")
+        end
+        return lines
+    end
+
+    sort(groupedList, function(a, b)
+        if a.impact ~= b.impact then
+            return a.impact > b.impact
+        end
+        return a.count > b.count
+    end)
+
+    local maxItems = min(3, #groupedList)
+    for i = 1, maxItems do
+        local item = groupedList[i]
+        local tag = REPORT_VERDICT_LABEL[item.verdict] or item.verdict
+        local countSuffix = (item.count > 1) and format(" (%dx)", item.count) or format(" @ %s", FormatReportClock(item.sampleTime))
+        if useColor then
+            local cHex = REPORT_VERDICT_COLOR[item.verdict] or "|cffffffff"
+            tinsert(lines, format(
+                "  %d. %s[%s]|r %s%s — %s",
+                i,
+                cHex,
+                tag,
+                item.spellName,
+                countSuffix,
+                item.sampleNote
+            ))
+        else
+            tinsert(lines, format(
+                "%d. [%s] %s%s - %s",
+                i,
+                tag,
+                item.spellName,
+                countSuffix,
+                item.sampleNote
+            ))
+        end
+    end
+
+    return lines
 end

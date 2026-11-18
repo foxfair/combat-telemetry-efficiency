@@ -82,10 +82,6 @@ local totemSlotState = {}
 
 local collectorFrame = CreateFrame("Frame")
 
-------------------------------------------------------------------------
--- Spellbook, Stance & Resource Helpers
-------------------------------------------------------------------------
-
 local function IsSpellUnlocked(spellID)
     if not spellID or spellID <= 0 then
         return false
@@ -272,10 +268,6 @@ local function IsSpellOffCooldown(spellID)
     return ((start + duration) - GetTime()) <= 0.05
 end
 
-------------------------------------------------------------------------
--- Dual-Resource Timeline Sampling & Druid Form Transitions
-------------------------------------------------------------------------
-
 local function RecordPowerSample(now, force)
     if not currentFight then
         return
@@ -344,10 +336,6 @@ local function RecordFormTransition(now)
     RecordPowerSample(now, true)
 end
 
-------------------------------------------------------------------------
--- Shaman Totem Slot Transition Tracker
-------------------------------------------------------------------------
-
 local function OnTotemUpdate(slot)
     if not isRecording or not currentFight or playerClass ~= "SHAMAN" then
         return
@@ -411,10 +399,6 @@ local function OnTotemUpdate(slot)
 
     RecordPowerSample(now, true)
 end
-
-------------------------------------------------------------------------
--- 15ms Macro Burst Resolution
-------------------------------------------------------------------------
 
 local function BuildEventRecord(entry, outcome, burstSize, fallbackNotes)
     local powerBefore = entry.powerBefore
@@ -578,10 +562,6 @@ local function AppendToBurst(now, spellID, castGUID)
     end
 end
 
-------------------------------------------------------------------------
--- Event Handlers
-------------------------------------------------------------------------
-
 local function OnSpellcastSent(unit, _, castGUID, spellID)
     if not isRecording or unit ~= "player" then
         return
@@ -712,10 +692,6 @@ local function OnCombatLogEvent()
         end
     end
 end
-
-------------------------------------------------------------------------
--- Public Lifecycle API
-------------------------------------------------------------------------
 
 function Collector:Init()
     playerGUID = UnitGUID("player")
