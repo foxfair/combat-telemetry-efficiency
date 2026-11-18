@@ -13,7 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ADDON_NAME: CombatTelemetryEfficiency
-      DEFAULT_CF_PROJECT_ID: "1815218"
 
     steps:
       - name: Checkout repository
@@ -53,10 +52,15 @@ jobs:
           generate_release_notes: true
 
       - name: Upload release ZIP to CurseForge
-        if: ${{ secrets.CF_API_KEY != '' }}
         env:
-          PROJECT_ID: ${{ vars.CF_PROJECT_ID || env.DEFAULT_CF_PROJECT_ID }}
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          PROJECT_ID: ${{ vars.CF_PROJECT_ID || '1815218' }}
         run: |
+          if [ -z "${CF_API_KEY}" ]; then
+            echo "CF_API_KEY is not set; skipping CurseForge upload."
+            exit 0
+          fi
+
           TAG_NAME="${GITHUB_REF_NAME}"
           ZIP_FILE="${ADDON_NAME}-${TAG_NAME}.zip"
           CHANGELOG=$(git tag -l --format='%(contents)' "${TAG_NAME}" | sed '/^-----BEGIN PGP SIGNATURE-----/,$d')
@@ -76,7 +80,7 @@ jobs:
             }')
 
           HTTP_CODE=$(curl -s -o cf_response.json -w "%{http_code}" \
-            -H "X-Api-Token: ${{ secrets.CF_API_KEY }}" \
+            -H "X-Api-Token: ${CF_API_KEY}" \
             -F "metadata=${METADATA}" \
             -F "file=@${ZIP_FILE}" \
             "https://wow.curseforge.com/api/projects/${PROJECT_ID}/upload-file")
