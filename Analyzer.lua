@@ -1139,3 +1139,145 @@ function Analyzer:BuildChatReport(fight, useColor)
 
     return lines
 end
+
+------------------------------------------------------------------------
+-- Multi-Fight Comparison Summary (v0.3.0)
+------------------------------------------------------------------------
+
+function Analyzer:BuildMultiFightComparison(fights)
+    local list = {}
+    if type(fights) == "table" then
+        for i = 1, #fights do
+            if fights[i] then
+                tinsert(list, fights[i])
+            end
+        end
+    end
+
+    local count = #list
+    if count == 0 then
+        return {
+            fightCount = 0,
+            rows = {},
+            avgScore = 0,
+            bestScore = 0,
+            worstScore = 0,
+            bestIdx = 1,
+            avgUptimePct = 0,
+            avgCpm = 0,
+            avgDuration = 0,
+            totalIdleSeconds = 0,
+            totalEarly = 0,
+            totalLate = 0,
+            totalOvercap = 0,
+            totalIdle = 0,
+            scoreDeltaLatestVsAvg = 0,
+            uptimeDeltaLatestVsAvg = 0,
+        }
+    end
+
+    local sumScore = 0
+    local sumUptime = 0
+    local sumCpm = 0
+    local sumDur = 0
+    local bestScore = -1
+    local worstScore = 101
+    local bestIdx = 1
+
+    local totalEarly = 0
+    local totalLate = 0
+    local totalOvercap = 0
+    local totalIdle = 0
+    local totalIdleSeconds = 0
+    local rows = {}
+
+    for i = 1, count do
+        local f = list[i]
+        local s = f.summary or {}
+        local sc = f.score or 100
+        local up = s.activeUptimePct or 0
+        local cpm = s.cpm or 0
+        local dur = f.duration or 0
+        local early = s.earlyStarvedCount or 0
+        local late = s.lateHoardCount or 0
+        local overcap = s.overcapWasteCount or 0
+        local idle = s.idleGapCount or 0
+        local idleSec = s.totalIdleSeconds or 0
+
+        sumScore = sumScore + sc
+        sumUptime = sumUptime + up
+        sumCpm = sumCpm + cpm
+        sumDur = sumDur + dur
+
+        if sc > bestScore then
+            bestScore = sc
+            bestIdx = i
+        end
+        if sc < worstScore then
+            worstScore = sc
+        end
+
+        totalEarly = totalEarly + early
+        totalLate = totalLate + late
+        totalOvercap = totalOvercap + overcap
+        totalIdle = totalIdle + idle
+        totalIdleSeconds = totalIdleSeconds + idleSec
+
+        tinsert(rows, {
+            index = i,
+            pinned = f.pinned and true or false,
+            targetName = f.targetName or "Encounter",
+            duration = dur,
+            score = sc,
+            uptimePct = up,
+            cpm = cpm,
+            efficient = s.efficientCount or 0,
+            early = early,
+            late = late,
+            overcap = overcap,
+            idle = idle,
+            idleSeconds = idleSec,
+            isBest = false,
+            isWorst = false,
+        })
+    end
+
+    local avgScore = sumScore / count
+    local avgUptimePct = sumUptime / count
+    local avgCpm = sumCpm / count
+    local avgDuration = sumDur / count
+
+    for i = 1, count do
+        local r = rows[i]
+        r.scoreDelta = r.score - avgScore
+        r.uptimeDelta = r.uptimePct - avgUptimePct
+        if count >= 2 then
+            if r.score == bestScore then
+                r.isBest = true
+            end
+            if r.score == worstScore and worstScore < bestScore then
+                r.isWorst = true
+            end
+        end
+    end
+
+    local latest = rows[1]
+    return {
+        fightCount = count,
+        rows = rows,
+        avgScore = avgScore,
+        bestScore = bestScore,
+        worstScore = worstScore,
+        bestIdx = bestIdx,
+        avgUptimePct = avgUptimePct,
+        avgCpm = avgCpm,
+        avgDuration = avgDuration,
+        totalIdleSeconds = totalIdleSeconds,
+        totalEarly = totalEarly,
+        totalLate = totalLate,
+        totalOvercap = totalOvercap,
+        totalIdle = totalIdle,
+        scoreDeltaLatestVsAvg = latest and (latest.score - avgScore) or 0,
+        uptimeDeltaLatestVsAvg = latest and (latest.uptimePct - avgUptimePct) or 0,
+    }
+end

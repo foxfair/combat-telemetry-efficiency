@@ -150,6 +150,7 @@ local fightMenuFrame = nil
 local settingsPopover = nil
 local reportPopover = nil
 local dumpFrame = nil
+local compareFrame = nil
 local isSyncingSettings = false
 local selectedFightIndex = 1
 local viewLayerMode = "DUAL"
@@ -2026,6 +2027,15 @@ function UI:Refresh()
             mainFrame.delAllBtn.label:SetText("Delete All")
             mainFrame.delAllBtn:SetEnabled(false)
         end
+        if mainFrame.compareBtn then
+            local isMulti = NS.Addon and NS.Addon.IsMultiFightMode and NS.Addon:IsMultiFightMode()
+            if isMulti then
+                mainFrame.compareBtn:Show()
+                mainFrame.compareBtn:SetEnabled(false)
+            else
+                mainFrame.compareBtn:Hide()
+            end
+        end
         if mainFrame.filterChips then
             for key, chip in pairs(mainFrame.filterChips) do
                 chip.label:SetText(chip.baseLabel)
@@ -2128,6 +2138,16 @@ function UI:Refresh()
             mainFrame.delAllBtn.label:SetText("Delete All")
         end
     end
+    if mainFrame.compareBtn then
+        local isMulti = NS.Addon and NS.Addon.IsMultiFightMode and NS.Addon:IsMultiFightMode()
+        if isMulti or #fights > 1 then
+            mainFrame.compareBtn:Show()
+            mainFrame.compareBtn:SetEnabled(#fights > 0)
+            mainFrame.compareBtn.label:SetText(format("Compare (%d)", #fights))
+        else
+            mainFrame.compareBtn:Hide()
+        end
+    end
 
     if mainFrame.filterChips then
         local totalAll = #(fight.events or {})
@@ -2165,6 +2185,9 @@ function UI:Refresh()
     RenderBand1(fight)
     RenderBand2(fight)
     RenderBand3(fight)
+    if compareFrame and compareFrame:IsShown() and UI.RefreshCompareWindow then
+        UI:RefreshCompareWindow()
+    end
 end
 
 local function ToggleFightDropdown(anchor)
@@ -2597,8 +2620,16 @@ local function EnsureMainFrame()
     end)
     f.pinBtn = pinBtn
 
+    local compareBtn = CreateActionButton(f, 82, 18, "Compare")
+    compareBtn:SetPoint("RIGHT", pinBtn, "LEFT", -4, 0)
+    compareBtn:SetScript("OnClick", function()
+        UI:ToggleCompareWindow()
+    end)
+    compareBtn:Hide()
+    f.compareBtn = compareBtn
+
     local fadeStatusText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    fadeStatusText:SetPoint("RIGHT", pinBtn, "LEFT", -10, 0)
+    fadeStatusText:SetPoint("RIGHT", compareBtn, "LEFT", -10, 0)
     fadeStatusText:SetJustifyH("RIGHT")
     fadeStatusText:Hide()
     f.fadeStatusText = fadeStatusText
@@ -3028,4 +3059,306 @@ function UI:ShowDumpWindow(text, subtitleText, titleText, plainText, jsonText, i
     f:Show()
     f.editBox:SetFocus()
     f.editBox:HighlightText()
+end
+
+
+------------------------------------------------------------------------
+-- Side-by-Side Multi-Fight Comparison Summary Window (v0.3.0)
+------------------------------------------------------------------------
+
+local COMPARE_ROW_HEIGHT = 24
+local COMPARE_VISIBLE_ROWS = 12
+
+local function EnsureCompareFrame()
+    if compareFrame then
+        return compareFrame
+    end
+
+    local f = CreateFrame("Frame", "CombatTelemetryEfficiencyCompareFrame", UIParent, BACKDROP_TEMPLATE)
+    f:SetSize(820, 430)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 20)
+    f:SetFrameStrata("FULLSCREEN_DIALOG")
+    f:SetMovable(true)
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    ApplyPanelBackdrop(f, 0.97, 0.32, 0.64, 0.92, 1.0)
+    f:Hide()
+
+    tinsert(UISpecialFrames, "CombatTelemetryEfficiencyCompareFrame")
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -12)
+    title:SetText("|cff5cc8ffCTE Multi-Fight Comparison Summary|r")
+
+    local modeBadge = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    modeBadge:SetPoint("LEFT", title, "RIGHT", 10, 0)
+    f.modeBadge = modeBadge
+
+    local closeBtn = CreateActionButton(f, 22, 22, "X")
+    closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -10, -9)
+    closeBtn:SetScript("OnClick", function()
+        f:Hide()
+    end)
+
+    local exportBtn = CreateActionButton(f, 92, 22, "Copy Table")
+    exportBtn:SetPoint("RIGHT", closeBtn, "LEFT", -6, 0)
+    exportBtn:SetScript("OnClick", function()
+        if NS.Addon and NS.Addon.BuildMultiFightSummaryText then
+            local txt, sub = NS.Addon:BuildMultiFightSummaryText()
+            if txt then
+                UI:ShowDumpWindow(txt, sub, "CTE Multi-Fight Comparison Export", nil, nil)
+            end
+        end
+    end)
+
+    -- 4 Aggregate KPI Summary Cards
+    local cardSpecs = {
+        { key = "avgScore",  label = "Avg / Best Score" },
+        { key = "avgUptime", label = "Avg GCD Uptime & CPM" },
+        { key = "latestVs",  label = "Latest (#1) vs Avg" },
+        { key = "mistakes",  label = "Total Mistakes Across Fights" },
+    }
+    f.cards = {}
+    local cardGap = 8
+    local totalInnerW = 820 - 24
+    local cardW = (totalInnerW - (cardGap * 3)) / 4
+    for idx = 1, 4 do
+        local spec = cardSpecs[idx]
+        local card = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
+        card:SetSize(cardW, 54)
+        if idx == 1 then
+            card:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -38)
+        else
+            card:SetPoint("LEFT", f.cards[idx - 1], "RIGHT", cardGap, 0)
+        end
+        ApplyPanelBackdrop(card, 0.94, 0.22, 0.26, 0.32, 1.0)
+
+        local lbl = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        lbl:SetPoint("TOPLEFT", card, "TOPLEFT", 8, -7)
+        lbl:SetText("|cff88929e" .. spec.label .. "|r")
+
+        local val = card:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        val:SetPoint("TOPLEFT", card, "TOPLEFT", 8, -22)
+        val:SetPoint("RIGHT", card, "RIGHT", -8, 0)
+        val:SetJustifyH("LEFT")
+
+        local sub = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        sub:SetPoint("BOTTOMLEFT", card, "BOTTOMLEFT", 8, 6)
+        sub:SetPoint("RIGHT", card, "RIGHT", -8, 0)
+        sub:SetJustifyH("LEFT")
+
+        card.val = val
+        card.sub = sub
+        f.cards[spec.key] = card
+    end
+
+    -- Side-by-Side Comparison Table Container
+    local tableBox = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
+    tableBox:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -100)
+    tableBox:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 12)
+    ApplyPanelBackdrop(tableBox, 0.95, 0.22, 0.25, 0.30, 1.0)
+
+    local hdrBg = tableBox:CreateTexture(nil, "ARTWORK")
+    hdrBg:SetHeight(22)
+    hdrBg:SetPoint("TOPLEFT", tableBox, "TOPLEFT", 1, -1)
+    hdrBg:SetPoint("TOPRIGHT", tableBox, "TOPRIGHT", -1, -1)
+    hdrBg:SetColorTexture(0.13, 0.15, 0.19, 1.0)
+
+    local cols = {
+        { text = "#",          x = 8,   w = 34,  justify = "LEFT" },
+        { text = "Encounter",  x = 44,  w = 188, justify = "LEFT" },
+        { text = "Dur",        x = 236, w = 48,  justify = "RIGHT" },
+        { text = "Score",      x = 290, w = 52,  justify = "RIGHT" },
+        { text = "vs Avg",     x = 346, w = 56,  justify = "RIGHT" },
+        { text = "Uptime",     x = 408, w = 54,  justify = "RIGHT" },
+        { text = "CPM",        x = 466, w = 46,  justify = "RIGHT" },
+        { text = "Eff",        x = 518, w = 36,  justify = "RIGHT" },
+        { text = "Early",      x = 558, w = 42,  justify = "RIGHT" },
+        { text = "Late",       x = 604, w = 40,  justify = "RIGHT" },
+        { text = "Over",       x = 648, w = 40,  justify = "RIGHT" },
+        { text = "Idle",       x = 692, w = 40,  justify = "RIGHT" },
+        { text = "Tag",        x = 738, w = 52,  justify = "LEFT" },
+    }
+
+    for i = 1, #cols do
+        local c = cols[i]
+        local h = tableBox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        h:SetPoint("LEFT", hdrBg, "LEFT", c.x, 0)
+        h:SetWidth(c.w)
+        h:SetJustifyH(c.justify)
+        h:SetText("|cff9aa5b4" .. c.text .. "|r")
+    end
+
+    local scrollFrame = CreateFrame("ScrollFrame", "CombatTelemetryEfficiencyCompareScroll", tableBox, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", tableBox, "TOPLEFT", 2, -25)
+    scrollFrame:SetPoint("BOTTOMRIGHT", tableBox, "BOTTOMRIGHT", -24, 4)
+    f.scrollFrame = scrollFrame
+
+    local content = CreateFrame("Frame", nil, scrollFrame)
+    content:SetSize(770, COMPARE_VISIBLE_ROWS * COMPARE_ROW_HEIGHT)
+    scrollFrame:SetScrollChild(content)
+    f.content = content
+    f.rowPool = {}
+    f.cols = cols
+
+    local emptyHint = tableBox:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    emptyHint:SetPoint("CENTER", tableBox, "CENTER", 0, -8)
+    emptyHint:Hide()
+    f.emptyHint = emptyHint
+
+    compareFrame = f
+    return f
+end
+
+function UI:RefreshCompareWindow()
+    local f = EnsureCompareFrame()
+    local fights = (NS.Addon and NS.Addon.db and NS.Addon.db.fights) or {}
+    local isMulti = NS.Addon and NS.Addon.IsMultiFightMode and NS.Addon:IsMultiFightMode()
+    local cap = (NS.Addon and NS.Addon.db and NS.Addon.db.maxFights) or 10
+
+    if isMulti then
+        f.modeBadge:SetText(format("|cff2ed16bMulti-Fight Mode ON|r |cff88929e(%d/%d stored — click any row to inspect)|r", #fights, cap))
+    else
+        f.modeBadge:SetText("|cfff5ad24Single-Fight Mode|r |cff88929e(enable Multi-Fight in Settings or /cte mode multi)|r")
+    end
+
+    local cmp = (NS.Analyzer and NS.Analyzer.BuildMultiFightComparison)
+        and NS.Analyzer:BuildMultiFightComparison(fights)
+        or { fightCount = 0, rows = {} }
+
+    for i = 1, #f.rowPool do
+        f.rowPool[i]:Hide()
+    end
+
+    if cmp.fightCount == 0 then
+        f.cards.avgScore.val:SetText("|cff88929e--|r")
+        f.cards.avgScore.sub:SetText("|cff6e7682No stored fights|r")
+        f.cards.avgUptime.val:SetText("|cff88929e--|r")
+        f.cards.avgUptime.sub:SetText("|cff6e7682Enter combat to record|r")
+        f.cards.latestVs.val:SetText("|cff88929e--|r")
+        f.cards.latestVs.sub:SetText("|cff6e7682--|r")
+        f.cards.mistakes.val:SetText("|cff88929e0|r")
+        f.cards.mistakes.sub:SetText("|cff6e7682Early 0 | Late 0 | Idle 0|r")
+        f.emptyHint:SetText("No recorded fights yet. Enable Multi-Fight mode and complete 2+ fights to compare.")
+        f.emptyHint:Show()
+        return
+    end
+
+    f.emptyHint:Hide()
+
+    local avgHex = (cmp.avgScore >= 88 and "|cff2ed16b") or (cmp.avgScore >= 70 and "|cfff5ad24") or "|cfff04047"
+    f.cards.avgScore.val:SetText(format("%s%.1f%%|r  |cff88929e(Best %d%%)|r", avgHex, cmp.avgScore, cmp.bestScore))
+    f.cards.avgScore.sub:SetText(format("|cff88929eLowest: %d%% across %d fight(s)|r", cmp.worstScore, cmp.fightCount))
+
+    f.cards.avgUptime.val:SetText(format("|cff5cc8ff%.0f%%|r  |cffd8e2ee(%.1f CPM)|r", cmp.avgUptimePct, cmp.avgCpm))
+    f.cards.avgUptime.sub:SetText(format("|cff88929eAvg Duration: %.1fs|r", cmp.avgDuration))
+
+    local dScore = cmp.scoreDeltaLatestVsAvg or 0
+    local dHex = (dScore >= 0.5 and "|cff2ed16b") or (dScore <= -0.5 and "|cfff04047") or "|cffd8e2ee"
+    local dUp = cmp.uptimeDeltaLatestVsAvg or 0
+    local uHex = (dUp >= 0.5 and "|cff2ed16b") or (dUp <= -0.5 and "|cfff04047") or "|cff88929e"
+    f.cards.latestVs.val:SetText(format("%s%+.1f%%|r  |cff88929eScore|r", dHex, dScore))
+    f.cards.latestVs.sub:SetText(format("%s%+.0f%% Uptime|r |cff88929evs session avg|r", uHex, dUp))
+
+    local totalMistakes = cmp.totalEarly + cmp.totalLate + cmp.totalOvercap + cmp.totalIdle
+    f.cards.mistakes.val:SetText(format("|cfff5ad24%d|r  |cff88929e(%.1fs dead)|r", totalMistakes, cmp.totalIdleSeconds))
+    f.cards.mistakes.sub:SetText(format(
+        "|cfff04047E:%d|r |cfff5ad24L:%d|r |cffd159ebO:%d|r |cfff28538I:%d|r",
+        cmp.totalEarly, cmp.totalLate, cmp.totalOvercap, cmp.totalIdle
+    ))
+
+    f.content:SetHeight(max(COMPARE_VISIBLE_ROWS * COMPARE_ROW_HEIGHT, #cmp.rows * COMPARE_ROW_HEIGHT))
+
+    for i = 1, #cmp.rows do
+        local r = cmp.rows[i]
+        local row = f.rowPool[i]
+        if not row then
+            row = CreateFrame("Button", nil, f.content)
+            row:SetHeight(COMPARE_ROW_HEIGHT)
+            row:SetPoint("TOPLEFT", f.content, "TOPLEFT", 0, -((i - 1) * COMPARE_ROW_HEIGHT))
+            row:SetPoint("TOPRIGHT", f.content, "TOPRIGHT", 0, -((i - 1) * COMPARE_ROW_HEIGHT))
+
+            local bg = row:CreateTexture(nil, "BACKGROUND")
+            bg:SetAllPoints()
+            row.bg = bg
+
+            local hl = row:CreateTexture(nil, "HIGHLIGHT")
+            hl:SetAllPoints()
+            hl:SetColorTexture(0.28, 0.56, 0.88, 0.25)
+
+            row.cells = {}
+            for cIdx = 1, #f.cols do
+                local col = f.cols[cIdx]
+                local fs = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                fs:SetPoint("LEFT", row, "LEFT", col.x - 2, 0)
+                fs:SetWidth(col.w)
+                fs:SetJustifyH(col.justify)
+                row.cells[cIdx] = fs
+            end
+            f.rowPool[i] = row
+        end
+
+        if r.index == selectedFightIndex then
+            row.bg:SetColorTexture(0.20, 0.36, 0.58, 0.45)
+        elseif i % 2 == 0 then
+            row.bg:SetColorTexture(0.12, 0.14, 0.18, 0.65)
+        else
+            row.bg:SetColorTexture(0.09, 0.11, 0.14, 0.45)
+        end
+
+        local sHex = (r.score >= 88 and "|cff2ed16b") or (r.score >= 70 and "|cfff5ad24") or "|cfff04047"
+        local sd = r.scoreDelta or 0
+        local sdHex = (sd >= 0.5 and "|cff2ed16b") or (sd <= -0.5 and "|cfff04047") or "|cff88929e"
+        local pinPrefix = r.pinned and "|cffffd100[P]|r " or ""
+        local tagStr = r.isBest and "|cff2ed16bBEST|r"
+            or (r.isWorst and "|cfff04047LOW|r" or (r.index == 1 and "|cff5cc8ffNEW|r" or ""))
+
+        row.cells[1]:SetText(format("|cff88929e#%d|r", r.index))
+        row.cells[2]:SetText(pinPrefix .. (r.targetName or "Encounter"))
+        row.cells[3]:SetText(FormatShortClock(r.duration))
+        row.cells[4]:SetText(format("%s%d%%|r", sHex, r.score))
+        row.cells[5]:SetText(format("%s%+.1f|r", sdHex, sd))
+        row.cells[6]:SetText(format("|cff5cc8ff%d%%|r", r.uptimePct))
+        row.cells[7]:SetText(format("%.1f", r.cpm))
+        row.cells[8]:SetText(format("|cff2ed16b%d|r", r.efficient))
+        row.cells[9]:SetText(r.early > 0 and format("|cfff04047%d|r", r.early) or "|cff6e76820|r")
+        row.cells[10]:SetText(r.late > 0 and format("|cfff5ad24%d|r", r.late) or "|cff6e76820|r")
+        row.cells[11]:SetText(r.overcap > 0 and format("|cffd159eb%d|r", r.overcap) or "|cff6e76820|r")
+        row.cells[12]:SetText(r.idle > 0 and format("|cfff28538%d|r", r.idle) or "|cff6e76820|r")
+        row.cells[13]:SetText(tagStr)
+
+        local targetIdx = r.index
+        row:SetScript("OnClick", function()
+            selectedFightIndex = targetIdx
+            verdictFilter = "ALL"
+            highlightedEventIndex = nil
+            local main = EnsureMainFrame()
+            if main.band3 and main.band3.scrollFrame then
+                main.band3.scrollFrame:SetVerticalScroll(0)
+            end
+            SetViewportRange(GetActiveFight(), 0, 1)
+            main:Show()
+            UI:Refresh()
+        end)
+
+        row:Show()
+    end
+end
+
+function UI:OpenCompareWindow()
+    local f = EnsureCompareFrame()
+    self:RefreshCompareWindow()
+    f:Show()
+end
+
+function UI:ToggleCompareWindow()
+    local f = EnsureCompareFrame()
+    if f:IsShown() then
+        f:Hide()
+    else
+        self:OpenCompareWindow()
+    end
 end

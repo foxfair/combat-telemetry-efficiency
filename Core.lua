@@ -1050,6 +1050,92 @@ function Addon:HandleMaxFightsCommand(arg)
     self:Print(format("Set Multi-Fight maxFights cap to |cff5cc8ff%d|r.", val))
 end
 
+function Addon:BuildMultiFightSummaryText()
+    local fights = (self.db and self.db.fights) or {}
+    if #fights == 0 then
+        return nil, "No recorded fights to compare."
+    end
+    if not (NS.Analyzer and NS.Analyzer.BuildMultiFightComparison) then
+        return nil, "Analyzer comparison module unavailable."
+    end
+
+    local cmp = NS.Analyzer:BuildMultiFightComparison(fights)
+    local lines = {
+        format(
+            "CTE Multi-Fight Comparison (%d fights) | Avg Score: %.1f%% (Best: %d%%, Worst: %d%%) | Avg Uptime: %.0f%% (%.1f CPM)",
+            cmp.fightCount,
+            cmp.avgScore,
+            cmp.bestScore,
+            cmp.worstScore,
+            cmp.avgUptimePct,
+            cmp.avgCpm
+        ),
+        format(
+            "Cumulative Mistakes: Early=%d | Late=%d | Overcap=%d | Idle=%d (%.1fs dead time)",
+            cmp.totalEarly,
+            cmp.totalLate,
+            cmp.totalOvercap,
+            cmp.totalIdle,
+            cmp.totalIdleSeconds
+        ),
+        "------------------------------------------------------------------------",
+    }
+
+    for i = 1, #cmp.rows do
+        local r = cmp.rows[i]
+        local tag = r.isBest and " [BEST]" or (r.isWorst and " [LOW]" or "")
+        local pin = r.pinned and "[P] " or ""
+        tinsert(lines, format(
+            "#%02d %s%s (%.1fs) | Score: %d%% (%+.1f) | Uptime: %d%% (%+.0f) | %.1f CPM | Eff:%d Early:%d Late:%d Over:%d Idle:%d%s",
+            r.index,
+            pin,
+            r.targetName,
+            r.duration,
+            r.score,
+            r.scoreDelta or 0,
+            r.uptimePct,
+            r.uptimeDelta or 0,
+            r.cpm,
+            r.efficient,
+            r.early,
+            r.late,
+            r.overcap,
+            r.idle,
+            tag
+        ))
+    end
+
+    return table.concat(lines, "\n"), format("%d stored fights", cmp.fightCount)
+end
+
+function Addon:HandleCompareCommand(arg)
+    local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
+    if trimmed == "chat" then
+        local text, err = self:BuildMultiFightSummaryText()
+        if not text then
+            self:Print(err)
+            return
+        end
+        for line in string.gmatch(text, "[^\n]+") do
+            DEFAULT_CHAT_FRAME:AddMessage("|cff5cc8ff" .. line .. "|r")
+        end
+        return
+    end
+
+    if NS.UI and NS.UI.OpenCompareWindow then
+        NS.UI:OpenCompareWindow()
+    else
+        local text, err = self:BuildMultiFightSummaryText()
+        if not text then
+            self:Print(err)
+            return
+        end
+        for line in string.gmatch(text, "[^\n]+") do
+            DEFAULT_CHAT_FRAME:AddMessage("|cff5cc8ff" .. line .. "|r")
+        end
+    end
+end
+
 function Addon:HandleModeCommand(arg)
     local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
     if trimmed == "" then
@@ -1127,6 +1213,8 @@ function Addon:HandleSlashCommand(input)
         self:HandleIdleCommand(rest)
     elseif cmd == "mode" or cmd == "history" then
         self:HandleModeCommand(rest)
+    elseif cmd == "compare" or cmd == "cmp" or cmd == "summary" then
+        self:HandleCompareCommand(rest)
     elseif cmd == "maxfights" or cmd == "cap" or cmd == "limit" then
         self:HandleMaxFightsCommand(rest)
     elseif cmd == "boss" or cmd == "bossonly" then
@@ -1165,7 +1253,7 @@ function Addon:HandleSlashCommand(input)
             self.db.thresholds.idleGapSeconds or DEFAULT_DB.thresholds.idleGapSeconds
         ))
     else
-        self:Print("Commands: /cte | /cte mode [single|multi] | /cte maxfights <2-25> | /cte dump [json|chat] [N|all] | /cte errors [chat|clear] | /cte idle <0.2-5.0> | /cte fade <3-30|off> | /cte pin [idx] | /cte del [idx] | /cte report [ch] | /cte boss | /cte clear [all]")
+        self:Print("Commands: /cte | /cte compare [chat] | /cte mode [single|multi] | /cte maxfights <2-25> | /cte dump [json|chat] [N|all] | /cte errors [chat|clear] | /cte idle <0.2-5.0> | /cte fade <3-30|off> | /cte pin [idx] | /cte del [idx] | /cte report [ch] | /cte boss | /cte clear [all]")
     end
 end
 
