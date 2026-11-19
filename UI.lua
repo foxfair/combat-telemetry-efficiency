@@ -2730,6 +2730,8 @@ local function EnsureDumpFrame()
     subtitle:SetTextColor(0.72, 0.78, 0.85)
     f.subtitle = subtitle
 
+    f.title = title
+
     local closeBtn = CreateActionButton(f, 22, 22, "X")
     closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -10, -9)
     closeBtn:SetScript("OnClick", function()
@@ -2742,6 +2744,27 @@ local function EnsureDumpFrame()
         f.editBox:SetFocus()
         f.editBox:HighlightText()
     end)
+
+    local fmtBtn = CreateActionButton(f, 64, 22, "JSON")
+    fmtBtn:SetPoint("RIGHT", selectAllBtn, "LEFT", -6, 0)
+    fmtBtn:Hide()
+    fmtBtn:SetScript("OnClick", function(self)
+        if not f.hasJsonPair then
+            return
+        end
+        f.showJson = not f.showJson
+        if f.showJson and f.jsonText then
+            self.label:SetText("Text")
+            f.editBox:SetText(f.jsonText)
+        else
+            self.label:SetText("JSON")
+            f.editBox:SetText(f.plainText or "")
+        end
+        f.scrollFrame:SetVerticalScroll(0)
+        f.editBox:SetFocus()
+        f.editBox:HighlightText()
+    end)
+    f.fmtBtn = fmtBtn
 
     local hint = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     hint:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -34)
@@ -2787,10 +2810,26 @@ local function EnsureDumpFrame()
     return f
 end
 
-function UI:ShowDumpWindow(text, subtitleText)
+function UI:ShowDumpWindow(text, subtitleText, titleText, plainText, jsonText, initialJson)
     local f = EnsureDumpFrame()
+    f.title:SetText("|cff5cc8ff" .. (titleText or "CTE Telemetry Dump") .. "|r")
     f.subtitle:SetText(subtitleText or "")
-    f.editBox:SetText(text or "")
+    f.plainText = plainText or text or ""
+    f.jsonText = jsonText
+    f.hasJsonPair = (jsonText ~= nil)
+    f.showJson = f.hasJsonPair and (initialJson == true) or false
+
+    if f.fmtBtn then
+        if f.hasJsonPair then
+            f.fmtBtn:Show()
+            f.fmtBtn.label:SetText(f.showJson and "Text" or "JSON")
+        else
+            f.fmtBtn:Hide()
+        end
+    end
+
+    local displayText = f.showJson and (f.jsonText or f.plainText) or (text or f.plainText)
+    f.editBox:SetText(displayText)
     f.scrollFrame:SetVerticalScroll(0)
     f:Show()
     f.editBox:SetFocus()

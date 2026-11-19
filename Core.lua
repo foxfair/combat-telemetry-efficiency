@@ -55,6 +55,7 @@ local MIN_AUTO_FADE_SECONDS = 3.0
 local MAX_AUTO_FADE_SECONDS = 30.0
 local MIN_IDLE_GAP_SECONDS = 0.2
 local MAX_IDLE_GAP_SECONDS = 5.0
+local MAX_STORED_ERRORS = 40
 
 local DEFAULT_DB = {
     version = 1,
@@ -65,6 +66,7 @@ local DEFAULT_DB = {
     autoFadeSeconds = 10.0,
     bossOnly = false,
     debug = false,
+    errorLog = {},
     minimap = {
         hide = false,
         angle = 220,
@@ -103,6 +105,120 @@ local function IsBossUnit(unit)
     end
     local level = SafeNumber(UnitLevel(unit), 0)
     return level == -1
+end
+
+local function JsonEscape(str)
+    local s = tostring(str or "")
+    s = s:gsub("\\", "\\\\")
+    s = s:gsub('"', '\\"')
+    s = s:gsub("\n", "\\n")
+    s = s:gsub("\r", "\\r")
+    s = s:gsub("\t", "\\t")
+    return '"' .. s .. '"'
+end
+
+local function JsonNum(val, fallback)
+    local n = tonumber(val)
+    if not n or n ~= n or n == math.huge or n == -math.huge then
+        return tostring(fallback or 0)
+    end
+    return tostring(n)
+end
+
+local function JsonBool(val)
+    return val and "true" or "false"
+end
+
+function Addon:RecordError(source, detail, isSecretDrop)
+    local db = self:EnsureDB()
+    if type(db.errorLog) ~= "table" then
+        db.errorLog = {}
+    end
+
+    local safeSource = SafeString(source, "Runtime")
+    local safeDetail = SafeString(detail, "Unknown error")
+    local _, classFile = UnitClass("player")
+    local safeClass = SafeString(classFile, "UNKNOWN")
+    local entry = {
+        timestamp = date and date("%Y-%m-%d %H:%M:%S") or tostring(time()),
+        uptime = format("%.1fs", GetTime() or 0),
+        playerClass = safeClass,
+        source = safeSource,
+        detail = safeDetail,
+        secretDrop = isSecretDrop and true or false,
+    }
+
+    tinsert(db.errorLog, 1, entry)
+    while #db.errorLog > MAX_STORED_ERRORS do
+        tremove(db.errorLog)
+    end
+end
+
+function Addon:GetErrorLog()
+    local db = self:EnsureDB()
+    if type(db.errorLog) ~= "table" then
+        db.errorLog = {}
+    end
+    return db.errorLog
+end
+
+function Addon:ClearErrorLog()
+    local db = self:EnsureDB()
+    db.errorLog = {}
+    self:Print("Cleared stored CTE error log.")
+end
+
+function Addon:BuildErrorLogText()
+    local entries = self:GetErrorLog()
+    if #entries == 0 then
+        return "CTE Error Log: 0 recorded errors or secret-value drops.\n\nNo errors logged across sessions."
+    end
+
+    local lines = {
+        format("CTE Error Log | Total Stored: %d (newest first)", #entries),
+        "------------------------------------------------------------------------",
+    }
+    for i = 1, #entries do
+        local e = entries[i]
+        local kind = e.secretDrop and "SECRET_DROP" or "ERROR"
+        tinsert(lines, format(
+            "#%02d [%s] (%s | %s) %s: %s",
+            i,
+            e.timestamp or "?",
+            e.playerClass or "?",
+            kind,
+            e.source or "Runtime",
+            e.detail or ""
+        ))
+    end
+    return table.concat(lines, "\n")
+end
+
+function Addon:HandleErrorsCommand(arg)
+    local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
+    if trimmed == "clear" or trimmed == "reset" then
+        self:ClearErrorLog()
+        return
+    end
+
+    local text = self:BuildErrorLogText()
+    local entries = self:GetErrorLog()
+    local subtitle = format("%d stored entry(s)", #entries)
+
+    if trimmed == "chat" then
+        for line in string.gmatch(text, "[^\n]+") do
+            DEFAULT_CHAT_FRAME:AddMessage("|cffff9966" .. line .. "|r")
+        end
+        return
+    end
+
+    if NS.UI and NS.UI.ShowDumpWindow then
+        NS.UI:ShowDumpWindow(text, subtitle, "CTE Error & Diagnostic Log", nil, nil)
+    else
+        for line in string.gmatch(text, "[^\n]+") do
+            DEFAULT_CHAT_FRAME:AddMessage("|cffff9966" .. line .. "|r")
+        end
+    end
 end
 
 function Addon:Print(msg)
@@ -311,6 +427,14 @@ function Addon:BuildFightDumpText(fight, arg)
     if (targetFight.secretPowerDrops or 0) > 0 then
         tinsert(lines, format("Note: Client returned secret power values %d time(s) during combat (fallback values used).", targetFight.secretPowerDrops))
     end
+        if not targetFight._loggedSecretDrop then
+            targetFight._loggedSecretDrop = true
+            self:RecordError(
+                "Collector:Power",
+                format("Fight vs %s had %d secret power sample(s) (1.60.1 combat masking)", targetFight.targetName or "Unknown", targetFight.secretPowerDrops),
+                true
+            )
+        end
 
     if targetFight.summary and targetFight.summary.activeUptimePct ~= nil then
         tinsert(lines, format(
@@ -365,29 +489,141 @@ function Addon:BuildFightDumpText(fight, arg)
     return table.concat(lines, "\n"), subtitle
 end
 
+function Addon:BuildFightJsonText(fight, arg)
+    local targetFight = fight or self:GetLatestFight()
+    if not targetFight then
+        return nil, "No recorded fight to export. Enter combat first."
+    end
+
+    local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
+    local events = targetFight.events or {}
+    local totalEvents = #events
+    local limit = totalEvents
+
+    if trimmed ~= "" and trimmed ~= "all" and trimmed ~= "json" then
+        local parsed = tonumber(trimmed)
+        if parsed and parsed > 0 then
+            limit = math.floor(parsed)
+        else
+            return nil, "Usage: /cte dump [json|chat] [count|all]"
+        end
+    end
+
+    local startIdx = math.max(1, totalEvents - limit + 1)
+    local sum = targetFight.summary or {}
+    local evJson = {}
+
+    for i = startIdx, totalEvents do
+        local ev = events[i]
+        tinsert(evJson, format(
+            '    {"idx":%d,"t":%s,"spellID":%s,"spellName":%s,"outcome":%s,"powerType":%s,"powerBefore":%s,"powerAfter":%s,"powerMax":%s,"powerIsSecret":%s,"spellCost":%s,"castTime":%s,"verdict":%s,"note":%s}',
+            i,
+            JsonNum(ev.t, 0),
+            JsonNum(ev.spellID, 0),
+            JsonEscape(ev.spellName or "?"),
+            JsonEscape(ev.outcome or "?"),
+            JsonNum(ev.powerType, -1),
+            JsonNum(ev.powerBefore, 0),
+            JsonNum(ev.powerAfter, 0),
+            JsonNum(ev.powerMax, 100),
+            JsonBool(ev.powerIsSecret),
+            JsonNum(ev.spellCost, 0),
+            JsonNum(ev.castTime, 0),
+            JsonEscape(ev.verdict or "NONE"),
+            JsonEscape(ev.note or "")
+        ))
+    end
+
+    local jsonStr = table.concat({
+        "{",
+        format('  "version": %s,', JsonEscape(C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(ADDON_NAME, "Version") or "0.2.2")),
+        format('  "targetName": %s,', JsonEscape(targetFight.targetName or "Unknown")),
+        format('  "playerClass": %s,', JsonEscape(targetFight.playerClass or "UNKNOWN")),
+        format('  "duration": %s,', JsonNum(targetFight.duration, 0)),
+        format('  "score": %s,', JsonNum(targetFight.score, 100)),
+        format('  "secretPowerDrops": %s,', JsonNum(targetFight.secretPowerDrops, 0)),
+        format('  "summary": {"activeUptimePct":%s,"cpm":%s,"idleGapCount":%s,"totalIdleSeconds":%s,"efficient":%s,"earlyStarved":%s,"lateHoard":%s,"overcapWaste":%s},',
+            JsonNum(sum.activeUptimePct, 0),
+            JsonNum(sum.cpm, 0),
+            JsonNum(sum.idleGapCount, 0),
+            JsonNum(sum.totalIdleSeconds, 0),
+            JsonNum(sum.efficientCount, 0),
+            JsonNum(sum.earlyStarvedCount, 0),
+            JsonNum(sum.lateHoardCount, 0),
+            JsonNum(sum.overcapWasteCount, 0)
+        ),
+        '  "events": [',
+        table.concat(evJson, ",\n"),
+        "  ]",
+        "}",
+    }, "\n")
+
+    local subtitle = format(
+        "%s (%.1fs) — JSON %d/%d events",
+        targetFight.targetName or "Unknown",
+        targetFight.duration or 0,
+        totalEvents > 0 and (totalEvents - startIdx + 1) or 0,
+        totalEvents
+    )
+    return jsonStr, subtitle
+end
+
 function Addon:DumpFightTelemetry(arg, fight)
     local trimmed = match(arg or "", "^%s*(.-)%s*$")
     local firstToken, rest = match(trimmed, "^(%S+)%s*(.-)$")
+    local firstLower = firstToken and lower(firstToken) or ""
     local toChat = false
+    local wantJson = false
     local countArg = trimmed
 
-    if firstToken and lower(firstToken) == "chat" then
+    if firstLower == "chat" then
         toChat = true
-        countArg = (rest ~= "" and rest) or "20"
+        local secToken, secRest = match(rest or "", "^(%S+)%s*(.-)$")
+        if secToken and lower(secToken) == "json" then
+            wantJson = true
+            countArg = (secRest ~= "" and secRest) or "all"
+        else
+            countArg = (rest ~= "" and rest) or "20"
+        end
+    elseif firstLower == "json" then
+        wantJson = true
+        countArg = (rest ~= "" and rest) or "all"
     end
 
-    local dumpText, subtitleOrErr = self:BuildFightDumpText(fight, countArg)
-    if not dumpText then
-        self:Print(subtitleOrErr)
+    local textDump, textSubOrErr = self:BuildFightDumpText(fight, countArg)
+    if not textDump then
+        self:Print(textSubOrErr)
         return
     end
 
-    if not toChat and NS.UI and NS.UI.ShowDumpWindow then
-        NS.UI:ShowDumpWindow(dumpText, subtitleOrErr)
+    if toChat then
+        local outLines = textDump
+        if wantJson then
+            local jDump = self:BuildFightJsonText(fight, countArg)
+            if jDump then
+                outLines = jDump
+            end
+        end
+        for line in string.gmatch(outLines, "[^\n]+") do
+            DEFAULT_CHAT_FRAME:AddMessage("|cffaaaaaa" .. line .. "|r")
+        end
         return
     end
 
-    for line in string.gmatch(dumpText, "[^\n]+") do
+    local jsonDump, jsonSub = self:BuildFightJsonText(fight, countArg)
+    if NS.UI and NS.UI.ShowDumpWindow then
+        NS.UI:ShowDumpWindow(
+            wantJson and (jsonDump or textDump) or textDump,
+            wantJson and (jsonSub or textSubOrErr) or textSubOrErr,
+            "CTE Telemetry Dump",
+            textDump,
+            jsonDump,
+            wantJson
+        )
+        return
+    end
+
+    for line in string.gmatch(textDump, "[^\n]+") do
         DEFAULT_CHAT_FRAME:AddMessage("|cffaaaaaa" .. line .. "|r")
     end
 end
@@ -763,6 +999,8 @@ function Addon:HandleSlashCommand(input)
         self:ClearHistory(lower(rest) == "all")
     elseif cmd == "dump" or cmd == "raw" then
         self:DumpFightTelemetry(rest)
+    elseif cmd == "errors" or cmd == "err" then
+        self:HandleErrorsCommand(rest)
     elseif cmd == "debug" then
         self.db.debug = not self.db.debug
         self:Print("Debug logging: " .. (self.db.debug and "ON" or "OFF"))
@@ -778,7 +1016,7 @@ function Addon:HandleSlashCommand(input)
             self.db.thresholds.hoardHoldSeconds
         ))
     else
-        self:Print("Commands: /cte | /cte idle <0.2-5.0> | /cte fade <3-30|off> | /cte pin [idx] | /cte del [idx] | /cte report [ch] | /cte dump [N|all] | /cte minimap | /cte boss | /cte clear [all]")
+        self:Print("Commands: /cte | /cte dump [json|chat] [N|all] | /cte errors [chat|clear] | /cte idle <0.2-5.0> | /cte fade <3-30|off> | /cte pin [idx] | /cte del [idx] | /cte report [ch] | /cte minimap | /cte boss | /cte clear [all]")
     end
 end
 
@@ -799,6 +1037,7 @@ local function SafeCall(label, fn, ...)
     end
     local ok, err = pcall(fn, ...)
     if not ok then
+        Addon:RecordError(label, tostring(err), false)
         Addon:Print("|cffff4d4dError in " .. label .. ":|r " .. tostring(err))
     end
     return ok
