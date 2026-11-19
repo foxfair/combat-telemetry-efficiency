@@ -15,20 +15,42 @@ local GetShapeshiftForm = GetShapeshiftForm
 local GetShapeshiftFormInfo = GetShapeshiftFormInfo
 local C_Spell = C_Spell
 local LegacyGetSpellInfo = GetSpellInfo
+local LegacyGetSpellTexture = GetSpellTexture
 local LegacyGetSpellPowerCost = GetSpellPowerCost
 local LegacyGetSpellCooldown = GetSpellCooldown
 
+local function CompatGetSpellTexture(spellID)
+    if C_Spell and C_Spell.GetSpellTexture then
+        local icon = C_Spell.GetSpellTexture(spellID)
+        if icon ~= nil then
+            return icon
+        end
+    end
+    if LegacyGetSpellTexture then
+        local icon = LegacyGetSpellTexture(spellID)
+        if icon ~= nil then
+            return icon
+        end
+    end
+    return nil
+end
+
 local function CompatGetSpellInfo(spellID)
     if LegacyGetSpellInfo then
-        return LegacyGetSpellInfo(spellID)
+        local name, rank, icon, castTime, minRange, maxRange, id = LegacyGetSpellInfo(spellID)
+        if icon == nil then
+            icon = CompatGetSpellTexture(spellID)
+        end
+        return name, rank, icon, castTime, minRange, maxRange, id
     end
     if C_Spell and C_Spell.GetSpellInfo then
         local info = C_Spell.GetSpellInfo(spellID)
         if info then
-            return info.name, nil, info.iconID, info.castTime, info.minRange, info.maxRange, info.spellID
+            local icon = info.iconID or info.originalIconID or CompatGetSpellTexture(spellID)
+            return info.name, nil, icon, info.castTime, info.minRange, info.maxRange, info.spellID
         end
     end
-    return nil
+    return nil, nil, CompatGetSpellTexture(spellID)
 end
 
 local function CompatGetSpellPowerCost(spellID)

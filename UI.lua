@@ -51,6 +51,41 @@ local OVERCAP_FALLBACK_ICON = "Interface\\Icons\\Spell_Nature_WispSplode"
 local IDLE_FALLBACK_ICON = "Interface\\Icons\\Spell_Holy_BorrowedTime"
 local DEFAULT_SPELL_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 
+local function ResolveSpellIcon(ev)
+    if not ev then
+        return DEFAULT_SPELL_ICON
+    end
+    if ev.isSyntheticIdle then
+        return IDLE_FALLBACK_ICON
+    end
+    if ev.isSyntheticOvercap then
+        return ev.spellIcon or OVERCAP_FALLBACK_ICON
+    end
+    if ev.spellIcon and ev.spellIcon ~= 134400 and ev.spellIcon ~= DEFAULT_SPELL_ICON then
+        return ev.spellIcon
+    end
+    local sid = ev.spellID
+    if sid and sid > 0 then
+        local tex = nil
+        if C_Spell and C_Spell.GetSpellTexture then
+            tex = C_Spell.GetSpellTexture(sid)
+        elseif GetSpellTexture then
+            tex = GetSpellTexture(sid)
+        end
+        if not tex and C_Spell and C_Spell.GetSpellInfo then
+            local info = C_Spell.GetSpellInfo(sid)
+            tex = info and (info.iconID or info.originalIconID)
+        elseif not tex and GetSpellInfo then
+            tex = select(3, GetSpellInfo(sid))
+        end
+        if tex and (not issecretvalue or not issecretvalue(tex)) then
+            ev.spellIcon = tex
+            return tex
+        end
+    end
+    return ev.spellIcon or DEFAULT_SPELL_ICON
+end
+
 local VERDICT_COLORS = {
     EFFICIENT = { 0.18, 0.82, 0.42, 1.0 },
     EARLY_STARVED = { 0.94, 0.25, 0.28, 1.0 },
@@ -528,6 +563,8 @@ local function SyncSettingsPopover()
     settingsPopover.autoShowCheck:SetCheckedState(db.autoShowAfterCombat == true)
     settingsPopover.fadeSlider:SetDisplayValue(db.autoFadeSeconds or DEFAULT_AUTO_FADE_SECONDS)
     settingsPopover.bannerCheck:SetCheckedState(db.showPostCombatBanner ~= false)
+    settingsPopover.multiFightCheck:SetCheckedState(db.recordMultiFights == true)
+    settingsPopover.maxFightsSlider:SetDisplayValue(db.maxFights or 10)
     settingsPopover.bossCheck:SetCheckedState(db.bossOnly == true)
     settingsPopover.minimapCheck:SetCheckedState(not (db.minimap and db.minimap.hide))
     isSyncingSettings = false
@@ -536,7 +573,7 @@ end
 local function ToggleSettingsPopover(anchor)
     if not settingsPopover then
         local pop = CreateFrame("Frame", nil, mainFrame, BACKDROP_TEMPLATE)
-        pop:SetSize(264, 392)
+        pop:SetSize(264, 480)
         pop:SetFrameStrata("FULLSCREEN_DIALOG")
         pop:EnableMouse(true)
         ApplyPanelBackdrop(pop, 0.98, 0.34, 0.66, 0.94, 1.0)
@@ -664,6 +701,41 @@ local function ToggleSettingsPopover(anchor)
         bannerCheck:SetPoint("TOPLEFT", fadeSlider, "BOTTOMLEFT", 0, -6)
         pop.bannerCheck = bannerCheck
 
+        local multiFightCheck = CreateCompactCheckbox(
+            pop,
+            238,
+            "Record Multiple Fights (History)",
+            "Off = Single-fight mode (latest only)",
+            function(checked)
+                if NS.Addon and NS.Addon.SetRecordMultiFights then
+                    NS.Addon:SetRecordMultiFights(checked)
+                elseif NS.Addon and NS.Addon.db then
+                    NS.Addon.db.recordMultiFights = checked
+                end
+            end
+        )
+        multiFightCheck:SetPoint("TOPLEFT", bannerCheck, "BOTTOMLEFT", 0, -6)
+        pop.multiFightCheck = multiFightCheck
+
+        local maxFightsSlider = CreateCompactSlider(
+            pop,
+            238,
+            "Multi-Fight History Cap",
+            2,
+            25,
+            1,
+            "%d",
+            function(val)
+                if NS.Addon and NS.Addon.SetMaxFights then
+                    NS.Addon:SetMaxFights(val)
+                elseif NS.Addon and NS.Addon.db then
+                    NS.Addon.db.maxFights = math.floor(val + 0.5)
+                end
+            end
+        )
+        maxFightsSlider:SetPoint("TOPLEFT", multiFightCheck, "BOTTOMLEFT", 0, -6)
+        pop.maxFightsSlider = maxFightsSlider
+
         local bossCheck = CreateCompactCheckbox(
             pop,
             238,
@@ -675,7 +747,7 @@ local function ToggleSettingsPopover(anchor)
                 end
             end
         )
-        bossCheck:SetPoint("TOPLEFT", bannerCheck, "BOTTOMLEFT", 0, -6)
+        bossCheck:SetPoint("TOPLEFT", maxFightsSlider, "BOTTOMLEFT", 0, -6)
         pop.bossCheck = bossCheck
 
         local minimapCheck = CreateCompactCheckbox(
@@ -704,6 +776,8 @@ local function ToggleSettingsPopover(anchor)
                 NS.Addon.db.showPostCombatBanner = true
                 NS.Addon.db.autoShowAfterCombat = false
                 NS.Addon.db.autoFadeSeconds = DEFAULT_AUTO_FADE_SECONDS
+                if NS.Addon.SetRecordMultiFights then NS.Addon:SetRecordMultiFights(false) else NS.Addon.db.recordMultiFights = false end
+                if NS.Addon.SetMaxFights then NS.Addon:SetMaxFights(defs and defs.maxFights or 10) else NS.Addon.db.maxFights = 10 end
                 NS.Addon.db.bossOnly = false
                 NS.Addon.db.minimap.hide = false
                 NS.Addon.db.minimap.angle = DEFAULT_MINIMAP_ANGLE
@@ -1736,10 +1810,7 @@ local function RenderBand2(fight)
             local cBorder = GetVerdictColor(ev.verdict)
             ApplyPanelBackdrop(pin, 1.0, cBorder[1], cBorder[2], cBorder[3], 1.0)
 
-            local texPath = ev.spellIcon
-                or (ev.isSyntheticIdle and IDLE_FALLBACK_ICON)
-                or (ev.isSyntheticOvercap and OVERCAP_FALLBACK_ICON)
-                or DEFAULT_SPELL_ICON
+            local texPath = ResolveSpellIcon(ev)
             pin.icon:SetTexture(texPath)
 
             if (ev.pressCount or 1) > 1 and not ev.isSyntheticOvercap then
@@ -1868,12 +1939,7 @@ local function RenderBand3(fight)
             end
 
             row.timeTxt:SetText(FormatClock(ev.t))
-            row.icon:SetTexture(
-                ev.spellIcon
-                    or (ev.isSyntheticIdle and IDLE_FALLBACK_ICON)
-                    or (ev.isSyntheticOvercap and OVERCAP_FALLBACK_ICON)
-                    or DEFAULT_SPELL_ICON
-            )
+            row.icon:SetTexture(ResolveSpellIcon(ev))
 
             local prefix = ""
             if ev.druidForm and DRUID_FORM_SHORT[ev.druidForm] then

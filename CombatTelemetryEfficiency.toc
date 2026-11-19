@@ -2,7 +2,8 @@
 ## Title: CombatTelemetryEfficiency
 ## Notes: Passive post-combat rotation and resource efficiency analyzer for WoW Forever
 ## Author: foxfair
-## Version: 0.2.4
+## Version: 0.2.7
+## IconTexture: Interface\Icons\INV_Misc_PocketWatch_01
 ## SavedVariables: CombatTelemetryEfficiencyDB
 ## X-Curse-Project-ID: 1815218
 
