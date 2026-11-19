@@ -13,15 +13,82 @@ local GetComboPoints = GetComboPoints
 local GetTotemInfo = GetTotemInfo
 local GetShapeshiftForm = GetShapeshiftForm
 local GetShapeshiftFormInfo = GetShapeshiftFormInfo
-local GetSpellInfo = GetSpellInfo
-local GetSpellPowerCost = GetSpellPowerCost
-local GetSpellCooldown = GetSpellCooldown
+local C_Spell = C_Spell
+local LegacyGetSpellInfo = GetSpellInfo
+local LegacyGetSpellPowerCost = GetSpellPowerCost
+local LegacyGetSpellCooldown = GetSpellCooldown
+
+local function CompatGetSpellInfo(spellID)
+    if LegacyGetSpellInfo then
+        return LegacyGetSpellInfo(spellID)
+    end
+    if C_Spell and C_Spell.GetSpellInfo then
+        local info = C_Spell.GetSpellInfo(spellID)
+        if info then
+            return info.name, nil, info.iconID, info.castTime, info.minRange, info.maxRange, info.spellID
+        end
+    end
+    return nil
+end
+
+local function CompatGetSpellPowerCost(spellID)
+    if LegacyGetSpellPowerCost then
+        return LegacyGetSpellPowerCost(spellID)
+    end
+    if C_Spell and C_Spell.GetSpellPowerCost then
+        return C_Spell.GetSpellPowerCost(spellID)
+    end
+    return nil
+end
+
+local function CompatGetSpellCooldown(spellID)
+    if LegacyGetSpellCooldown then
+        return LegacyGetSpellCooldown(spellID)
+    end
+    if C_Spell and C_Spell.GetSpellCooldown then
+        local info = C_Spell.GetSpellCooldown(spellID)
+        if info then
+            return info.startTime, info.duration, info.isEnabled, info.modRate
+        end
+    end
+    return 0, 0, true, 1
+end
+
+local GetSpellInfo = CompatGetSpellInfo
+local GetSpellPowerCost = CompatGetSpellPowerCost
+local GetSpellCooldown = CompatGetSpellCooldown
 local IsPlayerSpell = IsPlayerSpell
 local IsSpellKnown = IsSpellKnown
 local CombatLogGetCurrentEventInfo = CombatLogGetCurrentEventInfo
 local tinsert = table.insert
 local max = math.max
 local abs = math.abs
+local issecretvalue = issecretvalue
+
+local function IsSecret(v)
+    return issecretvalue and issecretvalue(v) or false
+end
+
+local function SafeNumber(v, fallback)
+    if v == nil or IsSecret(v) or type(v) ~= "number" then
+        return fallback
+    end
+    return v
+end
+
+local function SafeString(v, fallback)
+    if v == nil or IsSecret(v) or type(v) ~= "string" then
+        return fallback
+    end
+    return v
+end
+
+local function SafeBool(v)
+    if v == nil or IsSecret(v) then
+        return false
+    end
+    return v and true or false
+end
 
 local Collector = {}
 NS.Collector = Collector
@@ -79,6 +146,8 @@ local lastSamplePower = -1
 local lastSecSampleTime = 0
 local lastSecSampleVal = -1
 local totemSlotState = {}
+local cachedPowerMax = {}
+local cachedPowerVal = {}
 
 local collectorFrame = CreateFrame("Frame")
 
@@ -99,36 +168,38 @@ end
 
 local function DetectDruidForm()
     if playerClass ~= "DRUID" or not GetShapeshiftForm then
-        return nil, UnitPowerType("player")
+        return nil, SafeNumber(UnitPowerType("player"), 0)
     end
 
-    local formIdx = GetShapeshiftForm() or 0
+    local formIdx = SafeNumber(GetShapeshiftForm(), 0)
     if formIdx == 0 then
         return "CASTER", 0
     end
 
     if GetShapeshiftFormInfo then
         local icon, _, _, spellID = GetShapeshiftFormInfo(formIdx)
-        if spellID and DRUID_FORM_SPELL_IDS[spellID] then
-            local formKey = DRUID_FORM_SPELL_IDS[spellID]
+        local safeSpellID = SafeNumber(spellID, nil)
+        if safeSpellID and DRUID_FORM_SPELL_IDS[safeSpellID] then
+            local formKey = DRUID_FORM_SPELL_IDS[safeSpellID]
             local pType = (formKey == "BEAR" and 1) or (formKey == "CAT" and 3) or 0
             return formKey, pType
         end
 
-        if type(icon) == "string" then
-            if icon:find("BearForm", 1, true) then
+        local safeIcon = SafeString(icon, nil)
+        if safeIcon then
+            if safeIcon:find("BearForm", 1, true) then
                 return "BEAR", 1
-            elseif icon:find("CatForm", 1, true) then
+            elseif safeIcon:find("CatForm", 1, true) then
                 return "CAT", 3
-            elseif icon:find("ForceOfNature", 1, true) or icon:find("Moonkin", 1, true) then
+            elseif safeIcon:find("ForceOfNature", 1, true) or safeIcon:find("Moonkin", 1, true) then
                 return "MOONKIN", 0
-            elseif icon:find("TravelForm", 1, true) or icon:find("AquaticForm", 1, true) then
+            elseif safeIcon:find("TravelForm", 1, true) or safeIcon:find("AquaticForm", 1, true) then
                 return "TRAVEL", 0
             end
         end
     end
 
-    local pType = UnitPowerType("player") or 0
+    local pType = SafeNumber(UnitPowerType("player"), 0)
     if pType == 1 then
         return "BEAR", 1
     elseif pType == 3 then
@@ -138,18 +209,43 @@ local function DetectDruidForm()
 end
 
 local function GetActivePowerInfo()
-    local powerType, powerToken = UnitPowerType("player")
-    local current = UnitPower("player", powerType) or 0
-    local maximum = UnitPowerMax("player", powerType) or 0
-    return powerType, powerToken, current, maximum
+    local rawType, rawToken = UnitPowerType("player")
+    local powerType = SafeNumber(rawType, 0)
+    local powerToken = SafeString(rawToken, "")
+
+    local rawCurrent = UnitPower("player", powerType)
+    local rawMaximum = UnitPowerMax("player", powerType)
+
+    local currentIsSecret = IsSecret(rawCurrent)
+    local maxIsSecret = IsSecret(rawMaximum)
+
+    local maximum = SafeNumber(rawMaximum, nil)
+    if maximum and maximum > 0 then
+        cachedPowerMax[powerType] = maximum
+    else
+        maximum = cachedPowerMax[powerType] or 100
+    end
+
+    local current = SafeNumber(rawCurrent, nil)
+    if current ~= nil then
+        cachedPowerVal[powerType] = current
+    else
+        current = cachedPowerVal[powerType] or 0
+        if currentFight and (currentIsSecret or maxIsSecret) then
+            currentFight.secretPowerDrops = (currentFight.secretPowerDrops or 0) + 1
+        end
+    end
+
+    return powerType, powerToken, current, maximum, (currentIsSecret or maxIsSecret)
 end
 
 local function ReadComboPoints()
-    local cp = UnitPower and UnitPower("player", 4) or 0
+    local cp = SafeNumber(UnitPower and UnitPower("player", 4), nil)
     if (not cp or cp == 0) and GetComboPoints then
-        cp = GetComboPoints("player", "target") or 0
+        cp = SafeNumber(GetComboPoints("player", "target"), 0)
     end
-    local maxCp = (UnitPowerMax and UnitPowerMax("player", 4)) or 5
+    cp = cp or 0
+    local maxCp = SafeNumber(UnitPowerMax and UnitPowerMax("player", 4), 5)
     if maxCp <= 0 then
         maxCp = 5
     end
@@ -157,15 +253,15 @@ local function ReadComboPoints()
 end
 
 local function HasLivingPet()
-    return UnitExists("pet") and not UnitIsDead("pet")
+    return SafeBool(UnitExists("pet")) and not SafeBool(UnitIsDead("pet"))
 end
 
 local function ReadPetFocus()
     if not HasLivingPet() then
         return 0, 0, false
     end
-    local cur = UnitPower("pet", 2) or 0
-    local maximum = UnitPowerMax("pet", 2) or 100
+    local cur = SafeNumber(UnitPower("pet", 2), 0)
+    local maximum = SafeNumber(UnitPowerMax("pet", 2), 100)
     if maximum <= 0 then
         maximum = 100
     end
@@ -179,9 +275,14 @@ local function ReadTotemSnapshot(now)
     local activeCount = 0
     local slots = {}
     for slot = 1, 4 do
-        local haveTotem, name, startTime, duration, icon = GetTotemInfo(slot)
+        local rawHave, rawName, rawStart, rawDur, rawIcon = GetTotemInfo(slot)
+        local haveTotem = SafeBool(rawHave)
+        local name = SafeString(rawName, "")
+        local startTime = SafeNumber(rawStart, 0)
+        local duration = SafeNumber(rawDur, 0)
+        local icon = SafeNumber(rawIcon, nil) or SafeString(rawIcon, nil)
         local remaining = 0
-        if haveTotem and startTime and duration and duration > 0 then
+        if haveTotem and startTime > 0 and duration > 0 then
             remaining = max(0, (startTime + duration) - now)
             if remaining > 0 then
                 activeCount = activeCount + 1
@@ -213,8 +314,8 @@ local function GetSecondaryState(now, primaryPowerType)
             local cp, maxCp = ReadComboPoints()
             return SECONDARY.COMBO_POINTS, cp, maxCp, { druidForm = formKey }
         elseif formKey == "BEAR" or primaryPowerType == 1 then
-            local mana = UnitPower("player", 0) or 0
-            local manaMax = UnitPowerMax("player", 0) or 0
+            local mana = SafeNumber(UnitPower("player", 0), cachedPowerVal[0] or 0)
+            local manaMax = SafeNumber(UnitPowerMax("player", 0), cachedPowerMax[0] or 0)
             if manaMax > 0 then
                 return SECONDARY.MANA_BACKUP, mana, manaMax, { druidForm = formKey }
             end
@@ -250,19 +351,22 @@ local function GetSpellCostForPower(spellID, preferredPowerType)
         end
     end
 
-    local cost = chosen.cost or chosen.minCost or 0
-    return cost, chosen.type or preferredPowerType
+    local cost = SafeNumber(chosen.cost, nil) or SafeNumber(chosen.minCost, 0)
+    local cType = SafeNumber(chosen.type, preferredPowerType)
+    return cost, cType
 end
 
 local function IsSpellOffCooldown(spellID)
     if not GetSpellCooldown then
         return true
     end
-    local start, duration = GetSpellCooldown(spellID)
-    if not start or start == 0 then
+    local rawStart, rawDuration = GetSpellCooldown(spellID)
+    local start = SafeNumber(rawStart, 0)
+    local duration = SafeNumber(rawDuration, 0)
+    if start == 0 then
         return true
     end
-    if duration and duration <= 1.5 then
+    if duration <= 1.5 then
         return true
     end
     return ((start + duration) - GetTime()) <= 0.05
@@ -273,9 +377,9 @@ local function RecordPowerSample(now, force)
         return
     end
 
-    local powerType, _, current, maximum = GetActivePowerInfo()
+    local powerType, _, current, maximum, isSecretPower = GetActivePowerInfo()
     local elapsed = now - lastSampleTime
-    local delta = abs(current - lastSamplePower)
+    local delta = isSecretPower and 0 or abs(current - lastSamplePower)
 
     if maximum > 0 and (force or elapsed >= SAMPLE_MIN_INTERVAL or delta >= 5) then
         lastSampleTime = now
@@ -346,10 +450,15 @@ local function OnTotemUpdate(slot)
 
     local now = GetTime()
     local relTime = now - currentFight.startTime
-    local haveTotem, name, startTime, duration, icon = GetTotemInfo(slot)
+    local rawHave, rawName, rawStart, rawDur, rawIcon = GetTotemInfo(slot)
+    local haveTotem = SafeBool(rawHave)
+    local name = SafeString(rawName, "")
+    local startTime = SafeNumber(rawStart, 0)
+    local duration = SafeNumber(rawDur, 0)
+    local icon = SafeNumber(rawIcon, nil) or SafeString(rawIcon, nil)
     local prev = totemSlotState[slot]
 
-    if haveTotem and name and name ~= "" and duration and duration > 0 then
+    if haveTotem and name ~= "" and duration > 0 then
         local clippedRemaining = 0
         local prevName = nil
         local emptyGap = nil
@@ -528,21 +637,24 @@ local function AppendToBurst(now, spellID, castGUID)
     local powerType, _, currentPower, maxPower = GetActivePowerInfo()
     local spellCost, costPowerType = GetSpellCostForPower(spellID, powerType)
     if costPowerType ~= powerType then
-        currentPower = UnitPower("player", costPowerType) or currentPower
-        maxPower = UnitPowerMax("player", costPowerType) or maxPower
+        currentPower = SafeNumber(UnitPower("player", costPowerType), cachedPowerVal[costPowerType] or currentPower)
+        maxPower = SafeNumber(UnitPowerMax("player", costPowerType), cachedPowerMax[costPowerType] or maxPower)
         powerType = costPowerType
     end
 
     local secType, secVal, secMax, extra = GetSecondaryState(now, powerType)
     local druidForm = (playerClass == "DRUID") and select(1, DetectDruidForm()) or nil
-    local name, _, icon = GetSpellInfo(spellID)
+    local rawName, _, rawIcon = GetSpellInfo(spellID)
+    local name = SafeString(rawName, nil)
+    local icon = SafeNumber(rawIcon, nil) or SafeString(rawIcon, nil)
+    local safeCastGUID = SafeString(castGUID, nil)
 
     local entry = {
         sentTime = now,
         spellID = spellID,
         spellName = name or ("Spell #" .. tostring(spellID)),
         spellIcon = icon,
-        castGUID = castGUID,
+        castGUID = safeCastGUID,
         powerType = powerType,
         powerBefore = currentPower,
         powerMax = maxPower,
@@ -557,22 +669,23 @@ local function AppendToBurst(now, spellID, castGUID)
     }
 
     tinsert(activeBurst.entries, entry)
-    if castGUID then
-        castGuidIndex[castGUID] = entry
+    if safeCastGUID then
+        castGuidIndex[safeCastGUID] = entry
     end
 end
 
 local function OnSpellcastSent(unit, _, castGUID, spellID)
-    if not isRecording or unit ~= "player" then
+    if not isRecording or SafeString(unit, "") ~= "player" then
         return
     end
-    if not IsSpellUnlocked(spellID) then
+    local safeSpellID = SafeNumber(spellID, nil)
+    if not safeSpellID or not IsSpellUnlocked(safeSpellID) then
         return
     end
 
     local now = GetTime()
     RecordPowerSample(now, false)
-    AppendToBurst(now, spellID, castGUID)
+    AppendToBurst(now, safeSpellID, SafeString(castGUID, nil))
 end
 
 local function OnSpellcastSucceeded(unit, castGUID, spellID)
@@ -580,16 +693,21 @@ local function OnSpellcastSucceeded(unit, castGUID, spellID)
         return
     end
 
+    local safeUnit = SafeString(unit, "")
+    local safeSpellID = SafeNumber(spellID, nil)
+    local safeCastGUID = SafeString(castGUID, nil)
     local now = GetTime()
 
-    if unit == "pet" and playerClass == "HUNTER" and currentFight then
+    if safeUnit == "pet" and playerClass == "HUNTER" and currentFight and safeSpellID then
         local petFocus, petMax = ReadPetFocus()
-        local name, _, icon = GetSpellInfo(spellID)
-        local cost = GetSpellCostForPower(spellID, 2)
+        local rawName, _, rawIcon = GetSpellInfo(safeSpellID)
+        local name = SafeString(rawName, nil)
+        local icon = SafeNumber(rawIcon, nil) or SafeString(rawIcon, nil)
+        local cost = GetSpellCostForPower(safeSpellID, 2)
         tinsert(currentFight.petCasts, {
             t = now - currentFight.startTime,
-            spellID = spellID,
-            spellName = name or ("Pet Spell #" .. tostring(spellID)),
+            spellID = safeSpellID,
+            spellName = name or ("Pet Spell #" .. tostring(safeSpellID)),
             spellIcon = icon,
             focusBefore = petFocus + (cost or 0),
             focusAfter = petFocus,
@@ -600,15 +718,15 @@ local function OnSpellcastSucceeded(unit, castGUID, spellID)
         return
     end
 
-    if unit ~= "player" then
+    if safeUnit ~= "player" then
         return
     end
 
-    local entry = castGUID and castGuidIndex[castGUID]
+    local entry = safeCastGUID and castGuidIndex[safeCastGUID]
     if entry then
         entry.state = "SUCCEEDED"
-    elseif IsSpellUnlocked(spellID) then
-        AppendToBurst(now, spellID, castGUID)
+    elseif safeSpellID and IsSpellUnlocked(safeSpellID) then
+        AppendToBurst(now, safeSpellID, safeCastGUID)
         local latest = activeBurst.entries[#activeBurst.entries]
         if latest then
             latest.state = "SUCCEEDED"
@@ -619,10 +737,11 @@ local function OnSpellcastSucceeded(unit, castGUID, spellID)
 end
 
 local function OnSpellcastFailed(unit, castGUID)
-    if not isRecording or unit ~= "player" then
+    if not isRecording or SafeString(unit, "") ~= "player" then
         return
     end
-    local entry = castGUID and castGuidIndex[castGUID]
+    local safeCastGUID = SafeString(castGUID, nil)
+    local entry = safeCastGUID and castGuidIndex[safeCastGUID]
     if entry and entry.state == "PENDING" then
         entry.state = "FAILED_OTHER"
     end
@@ -633,7 +752,7 @@ local function OnUIErrorMessage(arg1, arg2)
         return
     end
 
-    local msg = (type(arg2) == "string" and arg2) or (type(arg1) == "string" and arg1)
+    local msg = SafeString(arg2, nil) or SafeString(arg1, nil)
     if not msg or not RESOURCE_ERRORS[msg] then
         return
     end
@@ -651,52 +770,67 @@ local function OnUIErrorMessage(arg1, arg2)
 end
 
 local function OnCombatLogEvent()
-    if not isRecording or not currentFight then
+    if not isRecording or not currentFight or not CombatLogGetCurrentEventInfo then
         return
     end
 
-    local _, subevent, _, _, _, _, _, destGUID, _, _, _,
-          spellID, spellName, _, amount, overEnergize, powerType = CombatLogGetCurrentEventInfo()
+    local _, rawSub, _, _, _, _, _, rawDestGUID, _, _, _,
+          rawSpellID, rawSpellName, _, rawAmount, rawOver, rawPType = CombatLogGetCurrentEventInfo()
 
-    local petGUID = UnitExists("pet") and UnitGUID("pet") or nil
+    local subevent = SafeString(rawSub, "")
+    if subevent ~= "SPELL_ENERGIZE" and subevent ~= "SPELL_PERIODIC_ENERGIZE" then
+        return
+    end
+
+    local destGUID = SafeString(rawDestGUID, nil)
+    if not destGUID then
+        return
+    end
+
+    local petGUID = SafeBool(UnitExists("pet")) and SafeString(UnitGUID("pet"), nil) or nil
     if destGUID ~= playerGUID and destGUID ~= petGUID then
         return
     end
 
-    if subevent == "SPELL_ENERGIZE" or subevent == "SPELL_PERIODIC_ENERGIZE" then
-        local isPet = (destGUID == petGUID and destGUID ~= playerGUID)
-        local unitToken = isPet and "pet" or "player"
-        local activeType = isPet and 2 or UnitPowerType("player")
-        local pType = powerType or activeType
-        local currentPower = UnitPower(unitToken, pType) or 0
-        local maxPower = UnitPowerMax(unitToken, pType) or 0
+    local isPet = (destGUID == petGUID and destGUID ~= playerGUID)
+    local unitToken = isPet and "pet" or "player"
+    local activeType = isPet and 2 or SafeNumber(UnitPowerType("player"), 0)
+    local pType = SafeNumber(rawPType, activeType)
+    local currentPower = SafeNumber(UnitPower(unitToken, pType), cachedPowerVal[pType] or 0)
+    local maxPower = SafeNumber(UnitPowerMax(unitToken, pType), cachedPowerMax[pType] or 0)
 
-        local wasted = 0
-        if type(overEnergize) == "number" and overEnergize > 0 then
-            wasted = overEnergize
-        elseif maxPower > 0 and currentPower >= maxPower and type(amount) == "number" and amount > 0 then
-            wasted = amount
-        end
+    local amount = SafeNumber(rawAmount, 0)
+    local overEnergize = SafeNumber(rawOver, 0)
+    local spellID = SafeNumber(rawSpellID, 0)
+    local spellName = SafeString(rawSpellName, "Resource Gain")
 
-        if wasted > 0 then
-            tinsert(currentFight.overcaps, {
-                t = GetTime() - currentFight.startTime,
-                spellID = spellID,
-                spellName = isPet and ("Pet: " .. (spellName or "Focus")) or spellName,
-                powerType = isPet and SECONDARY.PET_FOCUS or pType,
-                amount = amount or 0,
-                wasted = wasted,
-                powerMax = maxPower,
-                isPet = isPet,
-            })
-        end
+    local wasted = 0
+    if overEnergize > 0 then
+        wasted = overEnergize
+    elseif maxPower > 0 and currentPower >= maxPower and amount > 0 then
+        wasted = amount
+    end
+
+    if wasted > 0 then
+        tinsert(currentFight.overcaps, {
+            t = GetTime() - currentFight.startTime,
+            spellID = spellID,
+            spellName = isPet and ("Pet: " .. spellName) or spellName,
+            powerType = isPet and SECONDARY.PET_FOCUS or pType,
+            amount = amount,
+            wasted = wasted,
+            powerMax = maxPower,
+            isPet = isPet,
+        })
     end
 end
 
 function Collector:Init()
-    playerGUID = UnitGUID("player")
+    playerGUID = SafeString(UnitGUID("player"), nil)
     local _, cls = UnitClass("player")
-    playerClass = cls
+    playerClass = SafeString(cls, nil)
+    -- Prime out-of-combat power cache so max/current fallback values are ready before combat
+    pcall(GetActivePowerInfo)
 
     collectorFrame:SetScript("OnEvent", function(_, event, ...)
         if event == "UNIT_SPELLCAST_SENT" then
@@ -708,7 +842,7 @@ function Collector:Init()
         elseif event == "UI_ERROR_MESSAGE" then
             OnUIErrorMessage(...)
         elseif event == "UNIT_POWER_FREQUENT" then
-            local unit = ...
+            local unit = SafeString(..., "")
             if isRecording and (unit == "player" or unit == "pet") then
                 RecordPowerSample(GetTime(), false)
             end
@@ -723,8 +857,6 @@ function Collector:Init()
             if isRecording and playerClass == "DRUID" then
                 RecordFormTransition(GetTime())
             end
-        elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
-            OnCombatLogEvent()
         end
     end)
 
@@ -735,12 +867,25 @@ function Collector:Init()
             end
         end
     end)
+
+    -- Register combat events once out of combat to avoid ADDON_ACTION_BLOCKED during lockdown.
+    -- Note: COMBAT_LOG_EVENT_UNFILTERED is intentionally omitted (triggers ADDON_ACTION_FORBIDDEN on 1.60.1).
+    pcall(collectorFrame.RegisterUnitEvent, collectorFrame, "UNIT_SPELLCAST_SENT", "player")
+    pcall(collectorFrame.RegisterUnitEvent, collectorFrame, "UNIT_SPELLCAST_SUCCEEDED", "player", "pet")
+    pcall(collectorFrame.RegisterUnitEvent, collectorFrame, "UNIT_SPELLCAST_FAILED", "player")
+    pcall(collectorFrame.RegisterUnitEvent, collectorFrame, "UNIT_SPELLCAST_FAILED_QUIET", "player")
+    pcall(collectorFrame.RegisterUnitEvent, collectorFrame, "UNIT_POWER_FREQUENT", "player", "pet")
+    pcall(collectorFrame.RegisterUnitEvent, collectorFrame, "UNIT_DISPLAYPOWER", "player")
+    pcall(collectorFrame.RegisterEvent, collectorFrame, "UPDATE_SHAPESHIFT_FORM")
+    pcall(collectorFrame.RegisterEvent, collectorFrame, "UNIT_COMBO_POINTS")
+    pcall(collectorFrame.RegisterEvent, collectorFrame, "PLAYER_TOTEM_UPDATE")
+    pcall(collectorFrame.RegisterEvent, collectorFrame, "UI_ERROR_MESSAGE")
 end
 
 function Collector:StartCombat(meta)
-    playerGUID = UnitGUID("player")
+    playerGUID = SafeString(UnitGUID("player"), nil) or meta.playerGUID
     local _, cls = UnitClass("player")
-    playerClass = cls or meta.playerClass
+    playerClass = SafeString(cls, nil) or meta.playerClass
 
     activeBurst = nil
     castGuidIndex = {}
@@ -768,19 +913,27 @@ function Collector:StartCombat(meta)
         overcaps = {},
         petCasts = {},
         totemEvents = {},
+        secretPowerDrops = 0,
         score = nil,
     }
 
     isRecording = true
 
+
+
     if playerClass == "DRUID" then
-        RecordFormTransition(meta.startTime)
+        pcall(RecordFormTransition, meta.startTime)
     end
 
     if playerClass == "SHAMAN" and GetTotemInfo then
         for slot = 1, 4 do
-            local haveTotem, name, startTime, duration, icon = GetTotemInfo(slot)
-            if haveTotem and name and duration and duration > 0 then
+            local rawHave, rawName, rawStart, rawDur, rawIcon = GetTotemInfo(slot)
+            local haveTotem = SafeBool(rawHave)
+            local name = SafeString(rawName, "")
+            local startTime = SafeNumber(rawStart, 0)
+            local duration = SafeNumber(rawDur, 0)
+            local icon = SafeNumber(rawIcon, nil) or SafeString(rawIcon, nil)
+            if haveTotem and name ~= "" and duration > 0 then
                 totemSlotState[slot] = {
                     active = true,
                     name = name,
@@ -793,19 +946,7 @@ function Collector:StartCombat(meta)
         end
     end
 
-    RecordPowerSample(meta.startTime, true)
-
-    collectorFrame:RegisterUnitEvent("UNIT_SPELLCAST_SENT", "player")
-    collectorFrame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "pet")
-    collectorFrame:RegisterUnitEvent("UNIT_SPELLCAST_FAILED", "player")
-    collectorFrame:RegisterUnitEvent("UNIT_SPELLCAST_FAILED_QUIET", "player")
-    collectorFrame:RegisterUnitEvent("UNIT_POWER_FREQUENT", "player", "pet")
-    collectorFrame:RegisterUnitEvent("UNIT_DISPLAYPOWER", "player")
-    collectorFrame:RegisterEvent("UPDATE_SHAPESHIFT_FORM")
-    collectorFrame:RegisterEvent("UNIT_COMBO_POINTS")
-    collectorFrame:RegisterEvent("PLAYER_TOTEM_UPDATE")
-    collectorFrame:RegisterEvent("UI_ERROR_MESSAGE")
-    collectorFrame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+    pcall(RecordPowerSample, meta.startTime, true)
 end
 
 function Collector:StopCombat()
@@ -825,7 +966,6 @@ function Collector:StopCombat()
     end
 
     isRecording = false
-    collectorFrame:UnregisterAllEvents()
 
     currentFight.endTime = now
     currentFight.duration = max(0, now - currentFight.startTime)

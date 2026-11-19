@@ -26,13 +26,13 @@ NS.UI = UI
 local BACKDROP_TEMPLATE = BackdropTemplateMixin and "BackdropTemplate" or nil
 
 local WINDOW_WIDTH = 856
-local WINDOW_HEIGHT = 496
+local WINDOW_HEIGHT = 524
 local BAND1_HEIGHT = 32
 local BAND2_HEIGHT = 198
 local LOG_ROW_HEIGHT = 22
 local VISIBLE_LOG_ROWS = 7
 local CURVE_SLICES = 150
-local MINIMAP_RADIUS = 80
+local MINIMAP_RIM_PADDING = 6
 local DEFAULT_MINIMAP_ANGLE = 220
 
 local SECONDARY = {
@@ -42,9 +42,9 @@ local SECONDARY = {
     TOTEM_SLOTS = 104,
 }
 
-local MINIMAP_BUTTON_ICON = "Interface\Icons\INV_Misc_PocketWatch_01"
-local OVERCAP_FALLBACK_ICON = "Interface\Icons\Spell_Nature_WispSplode"
-local DEFAULT_SPELL_ICON = "Interface\Icons\INV_Misc_QuestionMark"
+local MINIMAP_BUTTON_ICON = "Interface\\Icons\\INV_Misc_PocketWatch_01"
+local OVERCAP_FALLBACK_ICON = "Interface\\Icons\\Spell_Nature_WispSplode"
+local DEFAULT_SPELL_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 
 local VERDICT_COLORS = {
     EFFICIENT = { 0.18, 0.82, 0.42, 1.0 },
@@ -111,6 +111,7 @@ local dumpFrame = nil
 local isSyncingSettings = false
 local selectedFightIndex = 1
 local viewLayerMode = "DUAL"
+local verdictFilter = "ALL" -- "ALL" | "ISSUES" | "EARLY_STARVED" | "LATE_HOARD" | "OVERCAP_WASTE"
 local zoomLevel = 1
 local viewStart = 0
 local viewEnd = 1
@@ -155,8 +156,8 @@ local function ApplyPanelBackdrop(frame, bgAlpha, borderR, borderG, borderB, bor
         return
     end
     frame:SetBackdrop({
-        bgFile = "Interface\Buttons\WHITE8x8",
-        edgeFile = "Interface\Buttons\WHITE8x8",
+        bgFile = "Interface\\Buttons\\WHITE8x8",
+        edgeFile = "Interface\\Buttons\\WHITE8x8",
         edgeSize = 1,
         insets = { left = 1, right = 1, top = 1, bottom = 1 },
     })
@@ -317,13 +318,16 @@ local function UpdateMinimapButtonPosition()
         angleDeg = NS.Addon.db.minimap.angle
     end
 
+    local radiusX = ((Minimap:GetWidth() or 140) * 0.5) + MINIMAP_RIM_PADDING
+    local radiusY = ((Minimap:GetHeight() or 140) * 0.5) + MINIMAP_RIM_PADDING
+
     local angleRad = rad(angleDeg)
-    local x = cos(angleRad) * MINIMAP_RADIUS
-    local y = sin(angleRad) * MINIMAP_RADIUS
+    local x = cos(angleRad) * radiusX
+    local y = sin(angleRad) * radiusY
 
     if GetMinimapShape and GetMinimapShape() == "SQUARE" then
-        x = max(-MINIMAP_RADIUS, min(MINIMAP_RADIUS, cos(angleRad) * MINIMAP_RADIUS * 1.35))
-        y = max(-MINIMAP_RADIUS, min(MINIMAP_RADIUS, sin(angleRad) * MINIMAP_RADIUS * 1.35))
+        x = max(-radiusX, min(radiusX, cos(angleRad) * radiusX * 1.4142))
+        y = max(-radiusY, min(radiusY, sin(angleRad) * radiusY * 1.4142))
     end
 
     minimapButton:ClearAllPoints()
@@ -361,7 +365,7 @@ function UI:InitMinimapButton()
     local bg = btn:CreateTexture(nil, "BACKGROUND")
     bg:SetSize(20, 20)
     bg:SetPoint("CENTER", 0, 1)
-    bg:SetTexture("Interface\Minimap\UI-Minimap-Background")
+    bg:SetTexture("Interface\\Minimap\\UI-Minimap-Background")
 
     local icon = btn:CreateTexture(nil, "ARTWORK")
     icon:SetSize(18, 18)
@@ -373,12 +377,12 @@ function UI:InitMinimapButton()
     local border = btn:CreateTexture(nil, "OVERLAY")
     border:SetSize(54, 54)
     border:SetPoint("TOPLEFT", 0, 0)
-    border:SetTexture("Interface\Minimap\MiniMap-TrackingBorder")
+    border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
 
     local hl = btn:CreateTexture(nil, "HIGHLIGHT")
     hl:SetSize(24, 24)
     hl:SetPoint("CENTER", 0, 1)
-    hl:SetTexture("Interface\Minimap\UI-Minimap-ZoomButton-Highlight")
+    hl:SetTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
     hl:SetBlendMode("ADD")
 
     btn.isDragging = false
@@ -729,13 +733,26 @@ local function ToggleReportPopover(anchor)
     anchor:SetActiveState(true)
 end
 
+local function MatchesVerdictFilter(ev)
+    if verdictFilter == "ALL" then
+        return true
+    elseif verdictFilter == "ISSUES" then
+        return ev.verdict ~= nil and ev.verdict ~= "EFFICIENT"
+    else
+        return ev.verdict == verdictFilter
+    end
+end
+
 local function RebuildFilteredEvents(fight)
     wipe(filteredEvents)
     if not fight or not fight.events then
         return
     end
     for i = 1, #fight.events do
-        tinsert(filteredEvents, fight.events[i])
+        local ev = fight.events[i]
+        if MatchesVerdictFilter(ev) then
+            tinsert(filteredEvents, ev)
+        end
     end
 end
 
@@ -1677,6 +1694,20 @@ function UI:Refresh()
         mainFrame.scoreText:SetText("|cff888888Score: --|r")
         mainFrame.summaryText:SetText("Enter combat to record rotation telemetry, then open /cte to inspect.")
         mainFrame.layerBtn.label:SetText("View: Dual")
+        if mainFrame.pinBtn then
+            mainFrame.pinBtn:SetActiveState(false)
+            mainFrame.pinBtn.label:SetText("Pin")
+            mainFrame.pinBtn:SetEnabled(false)
+        end
+        if mainFrame.delBtn then
+            mainFrame.delBtn:SetEnabled(false)
+        end
+        if mainFrame.filterChips then
+            for key, chip in pairs(mainFrame.filterChips) do
+                chip.label:SetText(chip.baseLabel)
+                chip:SetActiveState(verdictFilter == key)
+            end
+        end
         RenderBand1(nil)
         RenderBand2(nil)
         RenderBand3(nil)
@@ -1687,8 +1718,10 @@ function UI:Refresh()
     local score = fight.score or 100
     local scoreHex = (score >= 88 and "|cff2ed16b") or (score >= 70 and "|cfff5ad24") or "|cfff04047"
 
+    local pinTag = fight.pinned and "|cffffd100[P]|r " or ""
     mainFrame.fightDropBtn.label:SetText(format(
-        "#%d %s (%s)  v",
+        "%s#%d %s (%s)  v",
+        pinTag,
         selectedFightIndex,
         fight.targetName or "Encounter",
         FormatShortClock(fight.duration)
@@ -1741,6 +1774,49 @@ function UI:Refresh()
 
     mainFrame.prevBtn:SetEnabled(selectedFightIndex < #fights)
     mainFrame.nextBtn:SetEnabled(selectedFightIndex > 1)
+
+    if mainFrame.pinBtn then
+        mainFrame.pinBtn:SetEnabled(true)
+        if fight.pinned then
+            mainFrame.pinBtn:SetActiveState(true)
+            mainFrame.pinBtn:SetBackdropColor(0.34, 0.27, 0.08, 1.0)
+            mainFrame.pinBtn:SetBackdropBorderColor(0.98, 0.80, 0.22, 1.0)
+            mainFrame.pinBtn.label:SetText("|cffffd100Pinned|r")
+        else
+            mainFrame.pinBtn:SetActiveState(false)
+            mainFrame.pinBtn.label:SetText("Pin")
+        end
+    end
+    if mainFrame.delBtn then
+        mainFrame.delBtn:SetEnabled(true)
+    end
+
+    if mainFrame.filterChips then
+        local totalAll = #(fight.events or {})
+        local earlyCnt = (sum and sum.earlyStarvedCount) or 0
+        local lateCnt = (sum and sum.lateHoardCount) or 0
+        local overcapCnt = (sum and sum.overcapWasteCount) or 0
+        local issuesCnt = earlyCnt + lateCnt + overcapCnt
+
+        local counts = {
+            ALL = totalAll,
+            ISSUES = issuesCnt,
+            EARLY_STARVED = earlyCnt,
+            LATE_HOARD = lateCnt,
+            OVERCAP_WASTE = overcapCnt,
+        }
+        for key, chip in pairs(mainFrame.filterChips) do
+            local cnt = counts[key] or 0
+            chip.label:SetText(format("%s (%d)", chip.baseLabel, cnt))
+            local isActive = (verdictFilter == key)
+            chip:SetActiveState(isActive)
+            if isActive and chip.activeRGB then
+                local c = chip.activeRGB
+                chip:SetBackdropColor(c[1] * 0.28, c[2] * 0.28, c[3] * 0.28, 1.0)
+                chip:SetBackdropBorderColor(c[1], c[2], c[3], 1.0)
+            end
+        end
+    end
 
     for z, btn in pairs(mainFrame.zoomButtons) do
         btn:SetActiveState(zoomLevel == z)
@@ -1811,7 +1887,11 @@ local function ToggleFightDropdown(anchor)
 
             item:SetScript("OnClick", function(self)
                 selectedFightIndex = self.fightIdx
+                verdictFilter = "ALL"
                 highlightedEventIndex = nil
+                if mainFrame and mainFrame.band3 and mainFrame.band3.scrollFrame then
+                    mainFrame.band3.scrollFrame:SetVerticalScroll(0)
+                end
                 SetViewportRange(GetActiveFight(), 0, 1)
                 fightMenuFrame:Hide()
                 UI:Refresh()
@@ -1823,7 +1903,8 @@ local function ToggleFightDropdown(anchor)
         item:SetPoint("TOPLEFT", fightMenuFrame, "TOPLEFT", 4, -4 - ((i - 1) * itemH))
         item:SetPoint("TOPRIGHT", fightMenuFrame, "TOPRIGHT", -4, -4 - ((i - 1) * itemH))
         item.txt:SetText(format(
-            "#%d %s (%s) — %d%%",
+            "%s#%d %s (%s) — %d%%",
+            f.pinned and "|cffffd100[P]|r " or "",
             i,
             f.targetName or "Encounter",
             FormatShortClock(f.duration),
@@ -1885,7 +1966,11 @@ local function EnsureMainFrame()
     prevBtn:SetPoint("LEFT", title, "RIGHT", 12, 0)
     prevBtn:SetScript("OnClick", function()
         selectedFightIndex = selectedFightIndex + 1
+        verdictFilter = "ALL"
         highlightedEventIndex = nil
+        if mainFrame and mainFrame.band3 and mainFrame.band3.scrollFrame then
+            mainFrame.band3.scrollFrame:SetVerticalScroll(0)
+        end
         SetViewportRange(GetActiveFight(), 0, 1)
         UI:Refresh()
     end)
@@ -1902,7 +1987,11 @@ local function EnsureMainFrame()
     nextBtn:SetPoint("LEFT", fightDropBtn, "RIGHT", 3, 0)
     nextBtn:SetScript("OnClick", function()
         selectedFightIndex = max(1, selectedFightIndex - 1)
+        verdictFilter = "ALL"
         highlightedEventIndex = nil
+        if mainFrame and mainFrame.band3 and mainFrame.band3.scrollFrame then
+            mainFrame.band3.scrollFrame:SetVerticalScroll(0)
+        end
         SetViewportRange(GetActiveFight(), 0, 1)
         UI:Refresh()
     end)
@@ -1960,6 +2049,38 @@ local function EnsureMainFrame()
     local summaryText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     summaryText:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -36)
     f.summaryText = summaryText
+
+    local delBtn = CreateActionButton(f, 44, 18, "Delete")
+    delBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -12, -33)
+    delBtn:SetScript("OnEnter", function(self)
+        if self:IsEnabled() then
+            self:SetBackdropBorderColor(0.94, 0.30, 0.32, 1.0)
+            self.label:SetTextColor(1.0, 0.55, 0.55)
+        end
+    end)
+    delBtn:SetScript("OnLeave", function(self)
+        self:SetBackdropBorderColor(0.28, 0.31, 0.36, 1.0)
+        self.label:SetTextColor(0.86, 0.89, 0.93)
+    end)
+    delBtn:SetScript("OnClick", function()
+        if NS.Addon and NS.Addon.DeleteFight then
+            NS.Addon:DeleteFight(selectedFightIndex)
+            verdictFilter = "ALL"
+            highlightedEventIndex = nil
+            SetViewportRange(GetActiveFight(), 0, 1)
+            UI:Refresh()
+        end
+    end)
+    f.delBtn = delBtn
+
+    local pinBtn = CreateActionButton(f, 52, 18, "Pin")
+    pinBtn:SetPoint("RIGHT", delBtn, "LEFT", -4, 0)
+    pinBtn:SetScript("OnClick", function()
+        if NS.Addon and NS.Addon.TogglePinFight then
+            NS.Addon:TogglePinFight(selectedFightIndex)
+        end
+    end)
+    f.pinBtn = pinBtn
 
     local band1 = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
     band1:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -54)
@@ -2077,10 +2198,52 @@ local function EnsureMainFrame()
     ApplyPanelBackdrop(band3, 0.92, 0.22, 0.25, 0.30, 1.0)
     f.band3 = band3
 
+    -- Band 3 Verdict Filter Chip Bar
+    local filterBar = CreateFrame("Frame", nil, band3)
+    filterBar:SetHeight(24)
+    filterBar:SetPoint("TOPLEFT", band3, "TOPLEFT", 2, -2)
+    filterBar:SetPoint("TOPRIGHT", band3, "TOPRIGHT", -2, -2)
+
+    local filterLabel = filterBar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    filterLabel:SetPoint("LEFT", filterBar, "LEFT", 6, 0)
+    filterLabel:SetText("|cff88929eFilter:|r")
+
+    local FILTER_DEFS = {
+        { key = "ALL",           label = "All",     width = 70, rgb = { 0.35, 0.72, 0.98 } },
+        { key = "ISSUES",        label = "Issues",  width = 82, rgb = { 0.96, 0.56, 0.22 } },
+        { key = "EARLY_STARVED", label = "Early",   width = 76, rgb = { 0.94, 0.25, 0.28 } },
+        { key = "LATE_HOARD",    label = "Late",    width = 72, rgb = { 0.96, 0.68, 0.14 } },
+        { key = "OVERCAP_WASTE", label = "Overcap", width = 88, rgb = { 0.82, 0.35, 0.92 } },
+    }
+
+    f.filterChips = {}
+    local chipAnchor = filterLabel
+    for idx = 1, #FILTER_DEFS do
+        local def = FILTER_DEFS[idx]
+        local chip = CreateActionButton(filterBar, def.width, 18, def.label)
+        chip:SetPoint("LEFT", chipAnchor, "RIGHT", (idx == 1) and 8 or 5, 0)
+        chip.baseLabel = def.label
+        chip.activeRGB = def.rgb
+        chip:SetScript("OnClick", function()
+            verdictFilter = def.key
+            highlightedEventIndex = nil
+            if band3.scrollFrame then
+                band3.scrollFrame:SetVerticalScroll(0)
+            end
+            UI:Refresh()
+        end)
+        f.filterChips[def.key] = chip
+        chipAnchor = chip
+    end
+
+    local filterHint = filterBar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    filterHint:SetPoint("RIGHT", filterBar, "RIGHT", -8, 0)
+    filterHint:SetText("|cff6e7682Filters timeline pins & step log|r")
+
     local headerBg = band3:CreateTexture(nil, "ARTWORK")
     headerBg:SetHeight(20)
-    headerBg:SetPoint("TOPLEFT", band3, "TOPLEFT", 1, -1)
-    headerBg:SetPoint("TOPRIGHT", band3, "TOPRIGHT", -1, -1)
+    headerBg:SetPoint("TOPLEFT", band3, "TOPLEFT", 1, -27)
+    headerBg:SetPoint("TOPRIGHT", band3, "TOPRIGHT", -1, -27)
     headerBg:SetColorTexture(0.13, 0.15, 0.19, 1.0)
 
     local hTime = band3:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -2104,7 +2267,7 @@ local function EnsureMainFrame()
     hNote:SetText("Verdict & Diagnostic Note")
 
     local clipFrame = CreateFrame("Frame", nil, band3)
-    clipFrame:SetPoint("TOPLEFT", band3, "TOPLEFT", 2, -22)
+    clipFrame:SetPoint("TOPLEFT", band3, "TOPLEFT", 2, -48)
     clipFrame:SetPoint("BOTTOMRIGHT", band3, "BOTTOMRIGHT", -2, 2)
     band3.clipFrame = clipFrame
 
@@ -2132,6 +2295,7 @@ end
 function UI:Show()
     local f = EnsureMainFrame()
     selectedFightIndex = 1
+    verdictFilter = "ALL"
     highlightedEventIndex = nil
     SetViewportRange(GetActiveFight(), 0, 1)
     f:Show()
@@ -2171,6 +2335,7 @@ function UI:OnFightRecorded(fight)
     end
     if mainFrame and mainFrame:IsShown() then
         selectedFightIndex = 1
+        verdictFilter = "ALL"
         highlightedEventIndex = nil
         SetViewportRange(fight, 0, 1)
         self:Refresh()

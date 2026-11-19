@@ -13,7 +13,26 @@ local SendChatMessage = SendChatMessage
 local IsInGroup = IsInGroup
 local IsInRaid = IsInRaid
 local IsInGuild = IsInGuild
+local issecretvalue = issecretvalue
 local tonumber = tonumber
+
+local function IsSecret(v)
+    return issecretvalue and issecretvalue(v) or false
+end
+
+local function SafeNumber(v, fallback)
+    if v == nil or IsSecret(v) or type(v) ~= "number" then
+        return fallback
+    end
+    return v
+end
+
+local function SafeString(v, fallback)
+    if v == nil or IsSecret(v) or type(v) ~= "string" then
+        return fallback
+    end
+    return v
+end
 local wipe = wipe
 local tinsert = table.insert
 local tremove = table.remove
@@ -71,11 +90,11 @@ local function IsBossUnit(unit)
     if not unit or not UnitExists(unit) then
         return false
     end
-    local classification = UnitClassification(unit)
+    local classification = SafeString(UnitClassification(unit), "")
     if classification == "worldboss" then
         return true
     end
-    local level = UnitLevel(unit)
+    local level = SafeNumber(UnitLevel(unit), 0)
     return level == -1
 end
 
@@ -102,19 +121,99 @@ function Addon:StoreFight(fight)
     end
     tinsert(self.db.fights, 1, fight)
     local limit = self.db.maxFights or MAX_SAVED_FIGHTS
+
+    -- Evict oldest UNPINNED fights first so pinned parses stay protected
     while #self.db.fights > limit do
-        tremove(self.db.fights)
+        local evictIdx = nil
+        for i = #self.db.fights, 1, -1 do
+            if not self.db.fights[i].pinned then
+                evictIdx = i
+                break
+            end
+        end
+        if evictIdx then
+            tremove(self.db.fights, evictIdx)
+        else
+            -- All stored fights are pinned; preserve them instead of evicting
+            break
+        end
     end
 end
 
-function Addon:ClearHistory()
-    if self.db and self.db.fights then
-        wipe(self.db.fights)
+function Addon:TogglePinFight(index)
+    if not self.db or not self.db.fights or #self.db.fights == 0 then
+        self:Print("No recorded fight to pin.")
+        return nil
     end
+    local idx = index or 1
+    local fight = self.db.fights[idx]
+    if not fight then
+        return nil
+    end
+    fight.pinned = not fight.pinned
     if NS.UI and NS.UI.Refresh then
         NS.UI:Refresh()
     end
-    self:Print("Cleared all recorded fight history.")
+    self:Print(format(
+        "%s fight #%d (%s).",
+        fight.pinned and "|cffffd100Pinned|r" or "Unpinned",
+        idx,
+        fight.targetName or "Encounter"
+    ))
+    return fight.pinned
+end
+
+function Addon:DeleteFight(index)
+    if not self.db or not self.db.fights or #self.db.fights == 0 then
+        self:Print("No recorded fight to delete.")
+        return false
+    end
+    local idx = index or 1
+    local fight = self.db.fights[idx]
+    if not fight then
+        return false
+    end
+    local name = fight.targetName or "Encounter"
+    tremove(self.db.fights, idx)
+    if NS.UI and NS.UI.Refresh then
+        NS.UI:Refresh()
+    end
+    self:Print(format("Deleted fight #%d (%s).", idx, name))
+    return true
+end
+
+function Addon:ClearHistory(includePinned)
+    if not self.db or not self.db.fights then
+        return
+    end
+
+    if includePinned then
+        wipe(self.db.fights)
+        if NS.UI and NS.UI.Refresh then
+            NS.UI:Refresh()
+        end
+        self:Print("Cleared all recorded fight history (including pinned fights).")
+        return
+    end
+
+    local keptPinned = 0
+    for i = #self.db.fights, 1, -1 do
+        if self.db.fights[i].pinned then
+            keptPinned = keptPinned + 1
+        else
+            tremove(self.db.fights, i)
+        end
+    end
+
+    if NS.UI and NS.UI.Refresh then
+        NS.UI:Refresh()
+    end
+
+    if keptPinned > 0 then
+        self:Print(format("Cleared unpinned fights (kept %d pinned). Use '/cte clear all' to wipe pinned fights.", keptPinned))
+    else
+        self:Print("Cleared all recorded fight history.")
+    end
 end
 
 function Addon:ReanalyzeAllFights()
@@ -200,6 +299,10 @@ function Addon:BuildFightDumpText(fight, arg)
 
     if targetFight.totemEvents and #targetFight.totemEvents > 0 then
         tinsert(lines, format("Totem Events: %d recorded", #targetFight.totemEvents))
+    end
+
+    if (targetFight.secretPowerDrops or 0) > 0 then
+        tinsert(lines, format("Note: Client returned secret power values %d time(s) during combat (fallback values used).", targetFight.secretPowerDrops))
     end
 
     tinsert(lines, "------------------------------------------------------------------------")
@@ -339,7 +442,7 @@ function Addon:CheckBossEngagement(unit, explicitBossName)
     end
     if IsBossUnit(unit) then
         self.sawBossEncounter = true
-        self.bossEncounterName = UnitName(unit) or self.bossEncounterName
+        self.bossEncounterName = SafeString(UnitName(unit), nil) or self.bossEncounterName
     end
 end
 
@@ -349,16 +452,18 @@ function Addon:OnCombatStart()
     end
     self.inCombat = true
     self.sawBossEncounter = IsBossUnit("target") or IsBossUnit("boss1")
-    self.bossEncounterName = self.sawBossEncounter and (UnitName("target") or UnitName("boss1")) or nil
+    local targetName = SafeString(UnitName("target"), nil)
+    local bossName = SafeString(UnitName("boss1"), nil)
+    self.bossEncounterName = self.sawBossEncounter and (targetName or bossName) or nil
 
     local _, classFile = UnitClass("player")
     local meta = {
         id = format("%d-%d", math.floor(GetTime()), math.random(1000, 9999)),
         timestamp = time(),
-        playerGUID = UnitGUID("player"),
-        playerClass = classFile,
-        playerLevel = UnitLevel("player"),
-        targetName = self.bossEncounterName or UnitName("target") or "Unknown Target",
+        playerGUID = SafeString(UnitGUID("player"), nil),
+        playerClass = SafeString(classFile, "UNKNOWN"),
+        playerLevel = SafeNumber(UnitLevel("player"), 60),
+        targetName = self.bossEncounterName or targetName or "Unknown Target",
         startTime = GetTime(),
         endTime = nil,
         duration = 0,
@@ -534,8 +639,14 @@ function Addon:HandleSlashCommand(input)
         self:Print("Boss-only recording: " .. (self.db.bossOnly and "|cff2ed16bON|r" or "|cffaaaaaaOFF|r"))
     elseif cmd == "rescore" or cmd == "reanalyze" then
         self:PrintRescoreSummary("Manual re-analysis complete.")
+    elseif cmd == "pin" or cmd == "unpin" then
+        local idx = tonumber(rest) or 1
+        self:TogglePinFight(idx)
+    elseif cmd == "del" or cmd == "delete" then
+        local idx = tonumber(rest) or 1
+        self:DeleteFight(idx)
     elseif cmd == "clear" or cmd == "reset" then
-        self:ClearHistory()
+        self:ClearHistory(lower(rest) == "all")
     elseif cmd == "dump" or cmd == "raw" then
         self:DumpFightTelemetry(rest)
     elseif cmd == "debug" then
@@ -552,8 +663,37 @@ function Addon:HandleSlashCommand(input)
             self.db.thresholds.hoardHoldSeconds
         ))
     else
-        self:Print("Commands: /cte | /cte report [self|party|raid|guild|say] | /cte dump [count|all] | /cte minimap | /cte mult <1.0-5.0> | /cte hold <0.0-10.0> | /cte boss | /cte rescore | /cte clear")
+        self:Print("Commands: /cte | /cte pin [idx] | /cte del [idx] | /cte report [ch] | /cte dump [N|all] | /cte minimap | /cte mult <1-5> | /cte hold <0-10> | /cte boss | /cte clear [all]")
     end
+end
+
+function Addon:EnsureDB()
+    if not self.db then
+        if type(CombatTelemetryEfficiencyDB) ~= "table" then
+            CombatTelemetryEfficiencyDB = {}
+        end
+        ApplyDefaults(CombatTelemetryEfficiencyDB, DEFAULT_DB)
+        self.db = CombatTelemetryEfficiencyDB
+    end
+    return self.db
+end
+
+local function SafeCall(label, fn, ...)
+    if type(fn) ~= "function" then
+        return true
+    end
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        Addon:Print("|cffff4d4dError in " .. label .. ":|r " .. tostring(err))
+    end
+    return ok
+end
+
+-- Register /cte at top level so the slash command is always available
+SLASH_COMBATTELEMETRYEFFICIENCY1 = "/cte"
+SlashCmdList["COMBATTELEMETRYEFFICIENCY"] = function(msg)
+    Addon:EnsureDB()
+    SafeCall("HandleSlashCommand", Addon.HandleSlashCommand, Addon, msg)
 end
 
 local eventFrame = CreateFrame("Frame")
@@ -566,32 +706,25 @@ pcall(eventFrame.RegisterEvent, eventFrame, "ENCOUNTER_START")
 
 eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2)
     if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
-        if type(CombatTelemetryEfficiencyDB) ~= "table" then
-            CombatTelemetryEfficiencyDB = {}
-        end
-        ApplyDefaults(CombatTelemetryEfficiencyDB, DEFAULT_DB)
-        Addon.db = CombatTelemetryEfficiencyDB
+        Addon:EnsureDB()
 
         if NS.Collector and NS.Collector.Init then
-            NS.Collector:Init()
+            SafeCall("Collector:Init", NS.Collector.Init, NS.Collector)
         end
 
         if NS.UI and NS.UI.InitMinimapButton then
-            NS.UI:InitMinimapButton()
-        end
-
-        SLASH_COMBATTELEMETRYEFFICIENCY1 = "/cte"
-        SlashCmdList["COMBATTELEMETRYEFFICIENCY"] = function(msg)
-            Addon:HandleSlashCommand(msg)
+            SafeCall("UI:InitMinimapButton", NS.UI.InitMinimapButton, NS.UI)
         end
 
         if InCombatLockdown() then
-            Addon:OnCombatStart()
+            SafeCall("OnCombatStart", Addon.OnCombatStart, Addon)
         end
     elseif event == "PLAYER_REGEN_DISABLED" then
-        Addon:OnCombatStart()
+        Addon:EnsureDB()
+        SafeCall("OnCombatStart", Addon.OnCombatStart, Addon)
     elseif event == "PLAYER_REGEN_ENABLED" then
-        Addon:OnCombatEnd()
+        Addon:EnsureDB()
+        SafeCall("OnCombatEnd", Addon.OnCombatEnd, Addon)
     elseif event == "PLAYER_TARGET_CHANGED" then
         Addon:CheckBossEngagement("target")
     elseif event == "UPDATE_MOUSEOVER_UNIT" then
