@@ -71,6 +71,8 @@ local DEFAULT_DB = {
         hide = false,
         angle = 220,
     },
+    windowPos = nil,
+    pillPos = nil,
     thresholds = {
         hoardMultiplier = 2.0,
         hoardHoldSeconds = 1.0,
@@ -964,6 +966,13 @@ function Addon:HandleSlashCommand(input)
     elseif cmd == "report" or cmd == "share" then
         local ch = (rest ~= "" and rest) or "SELF"
         self:ShareFightReport(nil, ch)
+    elseif cmd == "center" or cmd == "resetpos" then
+        self.db.windowPos = nil
+        self.db.pillPos = nil
+        if NS.UI and NS.UI.ResetWindowPosition then
+            NS.UI:ResetWindowPosition()
+        end
+        self:Print("Reset CTE window and notification pill positions.")
     elseif cmd == "minimap" or cmd == "icon" then
         self.db.minimap.hide = not self.db.minimap.hide
         if NS.UI and NS.UI.UpdateMinimapButton then

@@ -179,6 +179,7 @@ end
 
 local function CreateActionButton(parent, width, height, text)
     local btn = CreateFrame("Button", nil, parent, BACKDROP_TEMPLATE)
+    btn:SetFrameLevel((parent and parent:GetFrameLevel() or 1) + 3)
     btn:SetSize(width, height)
     ApplyPanelBackdrop(btn, 0.95, 0.28, 0.31, 0.36, 1.0)
 
@@ -984,15 +985,48 @@ local function SampleTempoAtTime(events, t, windowHalf)
     return max(0, min(1, active / wSpan))
 end
 
+local function SavePillPosition(frame)
+    if not frame or not NS.Addon or not NS.Addon.db then
+        return
+    end
+    local point, _, relativePoint, xOfs, yOfs = frame:GetPoint(1)
+    if point then
+        NS.Addon.db.pillPos = {
+            point = point,
+            relativePoint = relativePoint or point,
+            x = xOfs or 0,
+            y = yOfs or 0,
+        }
+    end
+end
+
+local function RestorePillPosition(frame)
+    if not frame then
+        return
+    end
+    frame:ClearAllPoints()
+    local pos = NS.Addon and NS.Addon.db and NS.Addon.db.pillPos
+    if type(pos) == "table" and type(pos.point) == "string" then
+        frame:SetPoint(pos.point, UIParent, pos.relativePoint or pos.point, pos.x or 0, pos.y or 0)
+    else
+        frame:SetPoint("TOP", UIParent, "TOP", 0, -96)
+    end
+end
+
 local function EnsureNotificationPill()
     if pillFrame then
         return pillFrame
     end
 
     local f = CreateFrame("Button", "CombatTelemetryEfficiencyPill", UIParent, BACKDROP_TEMPLATE)
-    f:SetSize(360, 32)
-    f:SetPoint("TOP", UIParent, "TOP", 0, -96)
+    f:SetSize(376, 32)
+    RestorePillPosition(f)
     f:SetFrameStrata("HIGH")
+    f:SetMovable(true)
+    f:SetClampedToScreen(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:RegisterForClicks("LeftButtonUp")
     ApplyPanelBackdrop(f, 0.94, 0.25, 0.58, 0.85, 1.0)
     f:Hide()
 
@@ -1011,6 +1045,7 @@ local function EnsureNotificationPill()
     local closeBtn = CreateFrame("Button", nil, f)
     closeBtn:SetSize(18, 18)
     closeBtn:SetPoint("RIGHT", f, "RIGHT", -5, 0)
+    closeBtn:SetFrameLevel(f:GetFrameLevel() + 2)
     local closeTxt = closeBtn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     closeTxt:SetPoint("CENTER")
     closeTxt:SetText("|cff999999x|r")
@@ -1019,8 +1054,20 @@ local function EnsureNotificationPill()
     end)
 
     f.autoHideAt = 0
+    f.isDragging = false
+    f:SetScript("OnDragStart", function(self)
+        self.isDragging = true
+        self.autoHideAt = 0
+        self:StartMoving()
+    end)
+    f:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        self.isDragging = false
+        self.autoHideAt = GetTime() + 18.0
+        SavePillPosition(self)
+    end)
     f:SetScript("OnUpdate", function(self)
-        if self.autoHideAt > 0 and not self:IsMouseOver() and GetTime() >= self.autoHideAt then
+        if not self.isDragging and self.autoHideAt > 0 and not self:IsMouseOver() and GetTime() >= self.autoHideAt then
             self:Hide()
         end
     end)
@@ -1033,6 +1080,9 @@ local function EnsureNotificationPill()
     end)
 
     f:SetScript("OnClick", function(self)
+        if self.isDragging then
+            return
+        end
         self:Hide()
         selectedFightIndex = 1
         UI:Show()
@@ -1047,6 +1097,7 @@ function UI:ShowPostCombatPill(fight)
         return
     end
     local pill = EnsureNotificationPill()
+    RestorePillPosition(pill)
     local score = fight.score or 100
     local scoreHex = "|cff2ed16b"
     local r, g, b = 0.20, 0.82, 0.45
@@ -2139,6 +2190,76 @@ local function ToggleFightDropdown(anchor)
     fightMenuFrame:Show()
 end
 
+local function SaveMainWindowPosition(frame)
+    if not frame or not NS.Addon or not NS.Addon.db then
+        return
+    end
+    local point, _, relativePoint, xOfs, yOfs = frame:GetPoint(1)
+    if point then
+        NS.Addon.db.windowPos = {
+            point = point,
+            relativePoint = relativePoint or point,
+            x = xOfs or 0,
+            y = yOfs or 0,
+        }
+    end
+end
+
+local function RestoreMainWindowPosition(frame)
+    if not frame then
+        return
+    end
+    frame:ClearAllPoints()
+    local pos = NS.Addon and NS.Addon.db and NS.Addon.db.windowPos
+    if type(pos) == "table" and type(pos.point) == "string" then
+        frame:SetPoint(pos.point, UIParent, pos.relativePoint or pos.point, pos.x or 0, pos.y or 0)
+    else
+        frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    end
+end
+
+function UI:ResetWindowPosition()
+    if NS.Addon and NS.Addon.db then
+        NS.Addon.db.windowPos = nil
+        NS.Addon.db.pillPos = nil
+    end
+    if mainFrame then
+        RestoreMainWindowPosition(mainFrame)
+    end
+    if pillFrame then
+        RestorePillPosition(pillFrame)
+    end
+end
+
+local function BeginMainWindowDrag()
+    if not mainFrame then
+        return
+    end
+    CancelAutoFade()
+    mainFrame:StartMoving()
+end
+
+local function EndMainWindowDrag()
+    if not mainFrame then
+        return
+    end
+    mainFrame:StopMovingOrSizing()
+    SaveMainWindowPosition(mainFrame)
+end
+
+local function AttachMainDragForwarder(targetFrame)
+    if not targetFrame then
+        return
+    end
+    targetFrame:EnableMouse(true)
+    targetFrame:RegisterForDrag("LeftButton")
+    targetFrame:SetScript("OnMouseDown", function()
+        CancelAutoFade()
+    end)
+    targetFrame:SetScript("OnDragStart", BeginMainWindowDrag)
+    targetFrame:SetScript("OnDragStop", EndMainWindowDrag)
+end
+
 local function EnsureMainFrame()
     if mainFrame then
         return mainFrame
@@ -2146,19 +2267,17 @@ local function EnsureMainFrame()
 
     local f = CreateFrame("Frame", "CombatTelemetryEfficiencyMainFrame", UIParent, BACKDROP_TEMPLATE)
     f:SetSize(WINDOW_WIDTH, WINDOW_HEIGHT)
-    f:SetPoint("CENTER")
+    RestoreMainWindowPosition(f)
     f:SetFrameStrata("DIALOG")
     f:SetMovable(true)
+    f:SetClampedToScreen(true)
     f:EnableMouse(true)
     f:RegisterForDrag("LeftButton")
     f:SetScript("OnMouseDown", function()
         CancelAutoFade()
     end)
-    f:SetScript("OnDragStart", function(self)
-        CancelAutoFade()
-        self:StartMoving()
-    end)
-    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    f:SetScript("OnDragStart", BeginMainWindowDrag)
+    f:SetScript("OnDragStop", EndMainWindowDrag)
     f:SetScript("OnUpdate", function(self)
         if not autoFadeArmed then
             return
@@ -2234,6 +2353,13 @@ local function EnsureMainFrame()
     local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     title:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -12)
     title:SetText("|cff5cc8ffCombatTelemetryEfficiency|r")
+
+    local headerDrag = CreateFrame("Frame", nil, f)
+    headerDrag:SetPoint("TOPLEFT", f, "TOPLEFT", 4, -4)
+    headerDrag:SetPoint("TOPRIGHT", f, "TOPRIGHT", -36, -4)
+    headerDrag:SetHeight(46)
+    headerDrag:SetFrameLevel(f:GetFrameLevel())
+    AttachMainDragForwarder(headerDrag)
 
     local closeBtn = CreateActionButton(f, 22, 22, "X")
     closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -10, -9)
@@ -2625,6 +2751,7 @@ end
 
 function UI:Show()
     local f = EnsureMainFrame()
+    RestoreMainWindowPosition(f)
     CancelAutoFade()
     f:SetAlpha(1.0)
     selectedFightIndex = 1
@@ -2712,6 +2839,7 @@ local function EnsureDumpFrame()
     f:SetPoint("CENTER")
     f:SetFrameStrata("FULLSCREEN_DIALOG")
     f:SetMovable(true)
+    f:SetClampedToScreen(true)
     f:EnableMouse(true)
     f:RegisterForDrag("LeftButton")
     f:SetScript("OnDragStart", f.StartMoving)
