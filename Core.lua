@@ -44,6 +44,8 @@ local match = string.match
 local Addon = {}
 NS.Addon = Addon
 
+local MIN_MAX_FIGHTS = 2
+local MAX_MAX_FIGHTS = 25
 local MAX_SAVED_FIGHTS = 10
 local MIN_FIGHT_DURATION = 3.0
 
@@ -61,6 +63,7 @@ local DEFAULT_DB = {
     version = 1,
     maxFights = MAX_SAVED_FIGHTS,
     minDuration = MIN_FIGHT_DURATION,
+    recordMultiFights = false,
     showPostCombatBanner = true,
     autoShowAfterCombat = false,
     autoFadeSeconds = 10.0,
@@ -240,10 +243,83 @@ function Addon:GetLatestFight()
     return self.db.fights[1]
 end
 
+function Addon:IsMultiFightMode()
+    return self.db and (self.db.recordMultiFights == true) or false
+end
+
+function Addon:SetRecordMultiFights(enabled)
+    local db = self:EnsureDB()
+    local multi = enabled and true or false
+    db.recordMultiFights = multi
+
+    -- When switching to Single-Fight mode, trim older unpinned logs down to the latest 1 fight
+    if not multi and type(db.fights) == "table" and #db.fights > 1 then
+        local keptUnpinned = 0
+        for i = 1, #db.fights do
+            if not db.fights[i].pinned then
+                keptUnpinned = keptUnpinned + 1
+                if keptUnpinned > 1 then
+                    db.fights[i]._trim = true
+                end
+            end
+        end
+        for i = #db.fights, 1, -1 do
+            if db.fights[i]._trim then
+                tremove(db.fights, i)
+            end
+        end
+    end
+
+    if NS.UI and NS.UI.Refresh then
+        NS.UI:Refresh()
+    end
+    return multi
+end
+
+function Addon:SetMaxFights(val)
+    local db = self:EnsureDB()
+    local clamped = math.floor(math.max(MIN_MAX_FIGHTS, math.min(MAX_MAX_FIGHTS, tonumber(val) or MAX_SAVED_FIGHTS)) + 0.5)
+    db.maxFights = clamped
+
+    if self:IsMultiFightMode() and type(db.fights) == "table" then
+        while #db.fights > clamped do
+            local evictIdx = nil
+            for i = #db.fights, 1, -1 do
+                if not db.fights[i].pinned then
+                    evictIdx = i
+                    break
+                end
+            end
+            if evictIdx then
+                tremove(db.fights, evictIdx)
+            else
+                break
+            end
+        end
+    end
+
+    if NS.UI and NS.UI.Refresh then
+        NS.UI:Refresh()
+    end
+    return clamped
+end
+
 function Addon:StoreFight(fight)
     if not fight or not self.db then
         return
     end
+
+    -- Single-fight mode (default): replace previous unpinned fight so only the latest fight is kept
+    if not self:IsMultiFightMode() then
+        for i = #self.db.fights, 1, -1 do
+            if not self.db.fights[i].pinned then
+                tremove(self.db.fights, i)
+            end
+        end
+        tinsert(self.db.fights, 1, fight)
+        return
+    end
+
     tinsert(self.db.fights, 1, fight)
     local limit = self.db.maxFights or MAX_SAVED_FIGHTS
 
@@ -941,6 +1017,65 @@ function Addon:HandleFadeCommand(arg)
     self:Print(format("Set post-combat auto-fade timeout to |cff5cc8ff%.0fs|r.", val))
 end
 
+function Addon:HandleMaxFightsCommand(arg)
+    local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
+    if trimmed == "" then
+        self:Print(format(
+            "Current maxFights (Multi-Fight cap): |cff5cc8ff%d|r (range %d–%d, default %d).",
+            self.db.maxFights or MAX_SAVED_FIGHTS,
+            MIN_MAX_FIGHTS,
+            MAX_MAX_FIGHTS,
+            MAX_SAVED_FIGHTS
+        ))
+        return
+    end
+
+    if trimmed == "default" or trimmed == "reset" then
+        local val = self:SetMaxFights(MAX_SAVED_FIGHTS)
+        self:Print(format("Reset maxFights cap to |cff5cc8ff%d|r.", val))
+        return
+    end
+
+    local parsed = tonumber(trimmed)
+    if not parsed or parsed < MIN_MAX_FIGHTS or parsed > MAX_MAX_FIGHTS then
+        self:Print(format(
+            "Invalid cap. Usage: /cte maxfights <%d–%d> or /cte maxfights default",
+            MIN_MAX_FIGHTS,
+            MAX_MAX_FIGHTS
+        ))
+        return
+    end
+
+    local val = self:SetMaxFights(parsed)
+    self:Print(format("Set Multi-Fight maxFights cap to |cff5cc8ff%d|r.", val))
+end
+
+function Addon:HandleModeCommand(arg)
+    local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
+    if trimmed == "" then
+        local multi = self:IsMultiFightMode()
+        self:Print(format(
+            "Recording mode: %s (use '/cte mode single' or '/cte mode multi').",
+            multi and format("|cff5cc8ffMulti-Fight|r (up to %d logs)", self.db.maxFights or MAX_SAVED_FIGHTS)
+                  or "|cff2ed16bSingle-Fight|r (default — latest fight only)"
+        ))
+        return
+    end
+
+    if trimmed == "multi" or trimmed == "multiple" or trimmed == "history" or trimmed == "on" then
+        self:SetRecordMultiFights(true)
+        self:Print(format("Recording mode: |cff5cc8ffMulti-Fight|r (retains up to %d fights).", self.db.maxFights or MAX_SAVED_FIGHTS))
+    elseif trimmed == "single" or trimmed == "one" or trimmed == "off" or trimmed == "default" then
+        self:SetRecordMultiFights(false)
+        self:Print("Recording mode: |cff2ed16bSingle-Fight|r (retains latest unpinned fight only).")
+    elseif trimmed == "toggle" then
+        local multi = self:SetRecordMultiFights(not self:IsMultiFightMode())
+        self:Print("Recording mode: " .. (multi and "|cff5cc8ffMulti-Fight|r" or "|cff2ed16bSingle-Fight|r"))
+    else
+        self:Print("Usage: /cte mode [single | multi | toggle]")
+    end
+end
+
 function Addon:HandleSlashCommand(input)
     local trimmed = match(input or "", "^%s*(.-)%s*$")
     local rawCmd, rest = match(trimmed, "^(%S+)%s*(.-)$")
@@ -990,6 +1125,10 @@ function Addon:HandleSlashCommand(input)
         self:HandleFadeCommand(rest)
     elseif cmd == "idle" or cmd == "gcd" then
         self:HandleIdleCommand(rest)
+    elseif cmd == "mode" or cmd == "history" then
+        self:HandleModeCommand(rest)
+    elseif cmd == "maxfights" or cmd == "cap" or cmd == "limit" then
+        self:HandleMaxFightsCommand(rest)
     elseif cmd == "boss" or cmd == "bossonly" then
         self.db.bossOnly = not self.db.bossOnly
         if NS.UI and NS.UI.Refresh then
@@ -1014,18 +1153,19 @@ function Addon:HandleSlashCommand(input)
         self.db.debug = not self.db.debug
         self:Print("Debug logging: " .. (self.db.debug and "ON" or "OFF"))
     elseif cmd == "status" then
+        local multi = self:IsMultiFightMode()
+        local cap = multi and (self.db.maxFights or MAX_SAVED_FIGHTS) or 1
         self:Print(format(
-            "InCombat: %s | Fights: %d/%d | BossOnly: %s | idle: %.2fs | mult: %.2fx | hold: %.2fs",
+            "InCombat: %s | Mode: %s | Fights: %d/%d | BossOnly: %s | idle: %.2fs",
             tostring(self.inCombat or false),
+            multi and "Multi" or "Single",
             #self.db.fights,
-            self.db.maxFights,
+            cap,
             self.db.bossOnly and "ON" or "OFF",
-            self.db.thresholds.idleGapSeconds or DEFAULT_DB.thresholds.idleGapSeconds,
-            self.db.thresholds.hoardMultiplier,
-            self.db.thresholds.hoardHoldSeconds
+            self.db.thresholds.idleGapSeconds or DEFAULT_DB.thresholds.idleGapSeconds
         ))
     else
-        self:Print("Commands: /cte | /cte dump [json|chat] [N|all] | /cte errors [chat|clear] | /cte idle <0.2-5.0> | /cte fade <3-30|off> | /cte pin [idx] | /cte del [idx] | /cte report [ch] | /cte minimap | /cte boss | /cte clear [all]")
+        self:Print("Commands: /cte | /cte mode [single|multi] | /cte maxfights <2-25> | /cte dump [json|chat] [N|all] | /cte errors [chat|clear] | /cte idle <0.2-5.0> | /cte fade <3-30|off> | /cte pin [idx] | /cte del [idx] | /cte report [ch] | /cte boss | /cte clear [all]")
     end
 end
 
