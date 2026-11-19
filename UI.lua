@@ -524,7 +524,7 @@ local function SyncSettingsPopover()
     settingsPopover.multSlider:SetDisplayValue(db.thresholds.hoardMultiplier or 2.0)
     settingsPopover.holdSlider:SetDisplayValue(db.thresholds.hoardHoldSeconds or 1.0)
     settingsPopover.idleSlider:SetDisplayValue(db.thresholds.idleGapSeconds or 0.6)
-    settingsPopover.autoShowCheck:SetCheckedState(db.autoShowAfterCombat ~= false)
+    settingsPopover.autoShowCheck:SetCheckedState(db.autoShowAfterCombat == true)
     settingsPopover.fadeSlider:SetDisplayValue(db.autoFadeSeconds or DEFAULT_AUTO_FADE_SECONDS)
     settingsPopover.bannerCheck:SetCheckedState(db.showPostCombatBanner ~= false)
     settingsPopover.bossCheck:SetCheckedState(db.bossOnly == true)
@@ -621,7 +621,7 @@ local function ToggleSettingsPopover(anchor)
         local autoShowCheck = CreateCompactCheckbox(
             pop,
             238,
-            "Auto-Open & Fade After Combat",
+            "Auto-Open Window After Combat (Opt-In)",
             "Closes if not clicked before timeout",
             function(checked)
                 if NS.Addon and NS.Addon.db then
@@ -701,7 +701,7 @@ local function ToggleSettingsPopover(anchor)
                 NS.Addon.db.thresholds.hoardHoldSeconds = defs and defs.thresholds.hoardHoldSeconds or 1.0
                 NS.Addon.db.thresholds.idleGapSeconds = defs and defs.thresholds.idleGapSeconds or 0.6
                 NS.Addon.db.showPostCombatBanner = true
-                NS.Addon.db.autoShowAfterCombat = true
+                NS.Addon.db.autoShowAfterCombat = false
                 NS.Addon.db.autoFadeSeconds = DEFAULT_AUTO_FADE_SECONDS
                 NS.Addon.db.bossOnly = false
                 NS.Addon.db.minimap.hide = false
@@ -2664,7 +2664,7 @@ end
 
 function UI:OnFightRecorded(fight)
     local db = NS.Addon and NS.Addon.db
-    local autoShow = (not db) or (db.autoShowAfterCombat ~= false)
+    local autoShow = db and (db.autoShowAfterCombat == true)
 
     if autoShow then
         local wasManuallyOpen = (mainFrame and mainFrame:IsShown() and not autoFadeArmed)
@@ -2686,7 +2686,7 @@ function UI:OnFightRecorded(fight)
         return
     end
 
-    if db and db.showPostCombatBanner then
+    if (not db) or (db.showPostCombatBanner ~= false) then
         self:ShowPostCombatPill(fight)
     end
     if mainFrame and mainFrame:IsShown() then

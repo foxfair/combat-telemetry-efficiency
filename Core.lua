@@ -61,7 +61,7 @@ local DEFAULT_DB = {
     maxFights = MAX_SAVED_FIGHTS,
     minDuration = MIN_FIGHT_DURATION,
     showPostCombatBanner = true,
-    autoShowAfterCombat = true,
+    autoShowAfterCombat = false,
     autoFadeSeconds = 10.0,
     bossOnly = false,
     debug = false,
@@ -647,8 +647,8 @@ function Addon:HandleFadeCommand(arg)
     local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
     if trimmed == "" then
         self:Print(format(
-            "Auto-open & fade after combat: %s | Timeout: |cff5cc8ff%.0fs|r (range %.0f–%.0fs, default %.0fs).",
-            (self.db.autoShowAfterCombat ~= false) and "|cff2ed16bON|r" or "|cffaaaaaaOFF|r",
+            "Auto-open after combat: %s (opt-in) | Fade timeout: |cff5cc8ff%.0fs|r (range %.0f–%.0fs, default %.0fs).",
+            self.db.autoShowAfterCombat and "|cff2ed16bON|r" or "|cffaaaaaaOFF|r",
             self.db.autoFadeSeconds or DEFAULT_DB.autoFadeSeconds,
             MIN_AUTO_FADE_SECONDS,
             MAX_AUTO_FADE_SECONDS,
@@ -662,7 +662,7 @@ function Addon:HandleFadeCommand(arg)
         if NS.UI and NS.UI.Refresh then
             NS.UI:Refresh()
         end
-        self:Print("Auto-open & fade after combat: |cffaaaaaaOFF|r")
+        self:Print("Auto-open after combat: |cffaaaaaaOFF|r")
         return
     end
 
@@ -671,7 +671,7 @@ function Addon:HandleFadeCommand(arg)
         if NS.UI and NS.UI.Refresh then
             NS.UI:Refresh()
         end
-        self:Print(format("Auto-open & fade after combat: |cff2ed16bON|r (%.0fs timeout).", self.db.autoFadeSeconds or DEFAULT_DB.autoFadeSeconds))
+        self:Print(format("Auto-open after combat: |cff2ed16bON|r (%.0fs auto-fade timeout).", self.db.autoFadeSeconds or DEFAULT_DB.autoFadeSeconds))
         return
     end
 
@@ -681,7 +681,7 @@ function Addon:HandleFadeCommand(arg)
         if NS.UI and NS.UI.Refresh then
             NS.UI:Refresh()
         end
-        self:Print(format("Reset auto-fade to |cff2ed16bON|r (|cff5cc8ff%.0fs|r).", self.db.autoFadeSeconds))
+        self:Print(format("Reset auto-open to |cffaaaaaaOFF|r (opt-in) and fade timeout to |cff5cc8ff%.0fs|r.", self.db.autoFadeSeconds))
         return
     end
 
