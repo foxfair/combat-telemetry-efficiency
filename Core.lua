@@ -51,12 +51,18 @@ local MIN_HOARD_MULTIPLIER = 1.0
 local MAX_HOARD_MULTIPLIER = 5.0
 local MIN_HOARD_HOLD_SECONDS = 0.0
 local MAX_HOARD_HOLD_SECONDS = 10.0
+local MIN_AUTO_FADE_SECONDS = 3.0
+local MAX_AUTO_FADE_SECONDS = 30.0
+local MIN_IDLE_GAP_SECONDS = 0.2
+local MAX_IDLE_GAP_SECONDS = 5.0
 
 local DEFAULT_DB = {
     version = 1,
     maxFights = MAX_SAVED_FIGHTS,
     minDuration = MIN_FIGHT_DURATION,
     showPostCombatBanner = true,
+    autoShowAfterCombat = true,
+    autoFadeSeconds = 10.0,
     bossOnly = false,
     debug = false,
     minimap = {
@@ -66,6 +72,7 @@ local DEFAULT_DB = {
     thresholds = {
         hoardMultiplier = 2.0,
         hoardHoldSeconds = 1.0,
+        idleGapSeconds = 0.6,
         spamDebounceSeconds = 0.40,
     },
     fights = {},
@@ -303,6 +310,16 @@ function Addon:BuildFightDumpText(fight, arg)
 
     if (targetFight.secretPowerDrops or 0) > 0 then
         tinsert(lines, format("Note: Client returned secret power values %d time(s) during combat (fallback values used).", targetFight.secretPowerDrops))
+    end
+
+    if targetFight.summary and targetFight.summary.activeUptimePct ~= nil then
+        tinsert(lines, format(
+            "Tempo: Active GCD Uptime %d%% | %.1f CPM | Idle Gaps: %d (%.1fs dead time)",
+            targetFight.summary.activeUptimePct or 0,
+            targetFight.summary.cpm or 0,
+            targetFight.summary.idleGapCount or 0,
+            targetFight.summary.totalIdleSeconds or 0
+        ))
     end
 
     tinsert(lines, "------------------------------------------------------------------------")
@@ -593,6 +610,99 @@ function Addon:HandleHoldCommand(arg)
     self:PrintRescoreSummary(format("Set hoardHoldSeconds to |cff5cc8ff%.2fs|r.", val))
 end
 
+function Addon:HandleIdleCommand(arg)
+    local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
+    if trimmed == "" then
+        self:Print(format(
+            "Current idleGapSeconds: |cff5cc8ff%.2fs|r (dead time after 1.5s GCD/cast; range %.1f–%.1f, default %.1fs).",
+            self.db.thresholds.idleGapSeconds or DEFAULT_DB.thresholds.idleGapSeconds,
+            MIN_IDLE_GAP_SECONDS,
+            MAX_IDLE_GAP_SECONDS,
+            DEFAULT_DB.thresholds.idleGapSeconds
+        ))
+        return
+    end
+
+    if trimmed == "default" or trimmed == "reset" then
+        self.db.thresholds.idleGapSeconds = DEFAULT_DB.thresholds.idleGapSeconds
+        self:PrintRescoreSummary(format("Reset idleGapSeconds to |cff5cc8ff%.2fs|r.", self.db.thresholds.idleGapSeconds))
+        return
+    end
+
+    local val = tonumber(trimmed)
+    if not val or val < MIN_IDLE_GAP_SECONDS or val > MAX_IDLE_GAP_SECONDS then
+        self:Print(format(
+            "Invalid idle grace. Usage: /cte idle <%.1f–%.1f> or /cte idle default",
+            MIN_IDLE_GAP_SECONDS,
+            MAX_IDLE_GAP_SECONDS
+        ))
+        return
+    end
+
+    self.db.thresholds.idleGapSeconds = val
+    self:PrintRescoreSummary(format("Set idleGapSeconds to |cff5cc8ff%.2fs|r.", val))
+end
+
+function Addon:HandleFadeCommand(arg)
+    local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
+    if trimmed == "" then
+        self:Print(format(
+            "Auto-open & fade after combat: %s | Timeout: |cff5cc8ff%.0fs|r (range %.0f–%.0fs, default %.0fs).",
+            (self.db.autoShowAfterCombat ~= false) and "|cff2ed16bON|r" or "|cffaaaaaaOFF|r",
+            self.db.autoFadeSeconds or DEFAULT_DB.autoFadeSeconds,
+            MIN_AUTO_FADE_SECONDS,
+            MAX_AUTO_FADE_SECONDS,
+            DEFAULT_DB.autoFadeSeconds
+        ))
+        return
+    end
+
+    if trimmed == "off" or trimmed == "disable" then
+        self.db.autoShowAfterCombat = false
+        if NS.UI and NS.UI.Refresh then
+            NS.UI:Refresh()
+        end
+        self:Print("Auto-open & fade after combat: |cffaaaaaaOFF|r")
+        return
+    end
+
+    if trimmed == "on" or trimmed == "enable" then
+        self.db.autoShowAfterCombat = true
+        if NS.UI and NS.UI.Refresh then
+            NS.UI:Refresh()
+        end
+        self:Print(format("Auto-open & fade after combat: |cff2ed16bON|r (%.0fs timeout).", self.db.autoFadeSeconds or DEFAULT_DB.autoFadeSeconds))
+        return
+    end
+
+    if trimmed == "default" or trimmed == "reset" then
+        self.db.autoShowAfterCombat = DEFAULT_DB.autoShowAfterCombat
+        self.db.autoFadeSeconds = DEFAULT_DB.autoFadeSeconds
+        if NS.UI and NS.UI.Refresh then
+            NS.UI:Refresh()
+        end
+        self:Print(format("Reset auto-fade to |cff2ed16bON|r (|cff5cc8ff%.0fs|r).", self.db.autoFadeSeconds))
+        return
+    end
+
+    local val = tonumber(trimmed)
+    if not val or val < MIN_AUTO_FADE_SECONDS or val > MAX_AUTO_FADE_SECONDS then
+        self:Print(format(
+            "Invalid timeout. Usage: /cte fade <%.0f–%.0f | on | off | default>",
+            MIN_AUTO_FADE_SECONDS,
+            MAX_AUTO_FADE_SECONDS
+        ))
+        return
+    end
+
+    self.db.autoShowAfterCombat = true
+    self.db.autoFadeSeconds = val
+    if NS.UI and NS.UI.Refresh then
+        NS.UI:Refresh()
+    end
+    self:Print(format("Set post-combat auto-fade timeout to |cff5cc8ff%.0fs|r.", val))
+end
+
 function Addon:HandleSlashCommand(input)
     local trimmed = match(input or "", "^%s*(.-)%s*$")
     local rawCmd, rest = match(trimmed, "^(%S+)%s*(.-)$")
@@ -631,6 +741,10 @@ function Addon:HandleSlashCommand(input)
         self:HandleMultiplierCommand(rest)
     elseif cmd == "hold" or cmd == "holdsec" or cmd == "hoardhold" then
         self:HandleHoldCommand(rest)
+    elseif cmd == "fade" or cmd == "autofade" then
+        self:HandleFadeCommand(rest)
+    elseif cmd == "idle" or cmd == "gcd" then
+        self:HandleIdleCommand(rest)
     elseif cmd == "boss" or cmd == "bossonly" then
         self.db.bossOnly = not self.db.bossOnly
         if NS.UI and NS.UI.Refresh then
@@ -654,16 +768,17 @@ function Addon:HandleSlashCommand(input)
         self:Print("Debug logging: " .. (self.db.debug and "ON" or "OFF"))
     elseif cmd == "status" then
         self:Print(format(
-            "InCombat: %s | Fights: %d/%d | BossOnly: %s | mult: %.2fx | hold: %.2fs",
+            "InCombat: %s | Fights: %d/%d | BossOnly: %s | idle: %.2fs | mult: %.2fx | hold: %.2fs",
             tostring(self.inCombat or false),
             #self.db.fights,
             self.db.maxFights,
             self.db.bossOnly and "ON" or "OFF",
+            self.db.thresholds.idleGapSeconds or DEFAULT_DB.thresholds.idleGapSeconds,
             self.db.thresholds.hoardMultiplier,
             self.db.thresholds.hoardHoldSeconds
         ))
     else
-        self:Print("Commands: /cte | /cte pin [idx] | /cte del [idx] | /cte report [ch] | /cte dump [N|all] | /cte minimap | /cte mult <1-5> | /cte hold <0-10> | /cte boss | /cte clear [all]")
+        self:Print("Commands: /cte | /cte idle <0.2-5.0> | /cte fade <3-30|off> | /cte pin [idx] | /cte del [idx] | /cte report [ch] | /cte dump [N|all] | /cte minimap | /cte boss | /cte clear [all]")
     end
 end
 

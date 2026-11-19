@@ -389,6 +389,7 @@ local function RecordPowerSample(now, force)
             powerType = powerType,
             power = current,
             powerMax = maximum,
+            isSecret = isSecretPower and true or false,
         })
     end
 
@@ -528,7 +529,9 @@ local function BuildEventRecord(entry, outcome, burstSize, fallbackNotes)
         powerBefore = powerBefore,
         powerAfter = powerAfter,
         powerMax = entry.powerMax,
+        powerIsSecret = entry.powerIsSecret and true or false,
         spellCost = cost,
+        castTime = entry.castTime or 0,
         druidForm = entry.druidForm,
         secondaryType = entry.secondaryType,
         secondaryBefore = entry.secondaryBefore,
@@ -634,19 +637,23 @@ local function AppendToBurst(now, spellID, castGUID)
         activeBurst.lastSentTime = now
     end
 
-    local powerType, _, currentPower, maxPower = GetActivePowerInfo()
+    local powerType, _, currentPower, maxPower, powerIsSecret = GetActivePowerInfo()
     local spellCost, costPowerType = GetSpellCostForPower(spellID, powerType)
     if costPowerType ~= powerType then
-        currentPower = SafeNumber(UnitPower("player", costPowerType), cachedPowerVal[costPowerType] or currentPower)
-        maxPower = SafeNumber(UnitPowerMax("player", costPowerType), cachedPowerMax[costPowerType] or maxPower)
+        local rawAltCur = UnitPower("player", costPowerType)
+        local rawAltMax = UnitPowerMax("player", costPowerType)
+        powerIsSecret = IsSecret(rawAltCur) or IsSecret(rawAltMax)
+        currentPower = SafeNumber(rawAltCur, cachedPowerVal[costPowerType] or currentPower)
+        maxPower = SafeNumber(rawAltMax, cachedPowerMax[costPowerType] or maxPower)
         powerType = costPowerType
     end
 
     local secType, secVal, secMax, extra = GetSecondaryState(now, powerType)
     local druidForm = (playerClass == "DRUID") and select(1, DetectDruidForm()) or nil
-    local rawName, _, rawIcon = GetSpellInfo(spellID)
+    local rawName, _, rawIcon, rawCastTime = GetSpellInfo(spellID)
     local name = SafeString(rawName, nil)
     local icon = SafeNumber(rawIcon, nil) or SafeString(rawIcon, nil)
+    local castTimeSec = max(0, SafeNumber(rawCastTime, 0) / 1000.0)
     local safeCastGUID = SafeString(castGUID, nil)
 
     local entry = {
@@ -658,7 +665,9 @@ local function AppendToBurst(now, spellID, castGUID)
         powerType = powerType,
         powerBefore = currentPower,
         powerMax = maxPower,
+        powerIsSecret = powerIsSecret and true or false,
         spellCost = spellCost,
+        castTime = castTimeSec,
         druidForm = druidForm,
         secondaryType = secType,
         secondaryBefore = secVal,

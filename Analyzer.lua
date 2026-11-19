@@ -17,6 +17,7 @@ Analyzer.VERDICTS = {
     EARLY_STARVED = "EARLY_STARVED",
     LATE_HOARD = "LATE_HOARD",
     OVERCAP_WASTE = "OVERCAP_WASTE",
+    IDLE_GAP = "IDLE_GAP",
 }
 
 local VERDICTS = Analyzer.VERDICTS
@@ -31,6 +32,7 @@ local SECONDARY = {
 local DEFAULT_THRESHOLDS = {
     hoardMultiplier = 2.0,
     hoardHoldSeconds = 1.0,
+    idleGapSeconds = 0.6,
     spamDebounceSeconds = 0.40,
 }
 
@@ -539,16 +541,123 @@ local function AnalyzeShamanTotemTelemetry(fight, summary)
     summary.totemClipCount = clipCount
 end
 
+local function AnalyzeCastTempoAndIdleGaps(fight, summary, thresholds)
+    local dur = max(0.5, fight.duration or 0.5)
+    local idleGrace = thresholds.idleGapSeconds or DEFAULT_THRESHOLDS.idleGapSeconds
+    local casts = {}
+
+    for i = 1, #fight.events do
+        local ev = fight.events[i]
+        if not ev.isSyntheticEvent and ev.outcome == "SUCCEEDED" then
+            tinsert(casts, ev)
+        end
+    end
+
+    local castCount = #casts
+    summary.succeededCastCount = castCount
+    summary.cpm = castCount / max(0.05, dur / 60.0)
+    summary.idleGapCount = 0
+    summary.totalIdleSeconds = 0
+    summary.weightedIdleMistakes = 0
+    summary.idleSegments = {}
+
+    if castCount == 0 then
+        summary.activeUptimePct = 0
+        return
+    end
+
+    -- Merge active GCD/cast intervals to compute true active uptime without double-counting off-GCD macros
+    local mergedActive = 0
+    local curStart = casts[1].t or 0
+    local curEnd = min(dur, curStart + max(1.5, casts[1].castTime or 0))
+
+    for i = 2, castCount do
+        local ev = casts[i]
+        local evStart = ev.t or 0
+        local evEnd = min(dur, evStart + max(1.5, ev.castTime or 0))
+        if evStart <= curEnd then
+            if evEnd > curEnd then
+                curEnd = evEnd
+            end
+        else
+            mergedActive = mergedActive + max(0, curEnd - curStart)
+            curStart = evStart
+            curEnd = evEnd
+        end
+    end
+    mergedActive = mergedActive + max(0, curEnd - curStart)
+    summary.activeUptimePct = floor(max(0, min(100, (mergedActive / dur) * 100.0)) + 0.5)
+
+    -- Flag dead-time idle gaps between consecutive player casts
+    local syntheticIdles = {}
+    for i = 1, castCount - 1 do
+        local prevEv = casts[i]
+        local nextEv = casts[i + 1]
+        local expectedBusy = max(1.5, prevEv.castTime or 0)
+        local busyEnd = (prevEv.t or 0) + expectedBusy
+        local rawGap = max(0, (nextEv.t or 0) - (prevEv.t or 0))
+        local idleTime = (nextEv.t or 0) - busyEnd
+
+        if idleTime >= idleGrace then
+            summary.idleGapCount = summary.idleGapCount + 1
+            summary.totalIdleSeconds = summary.totalIdleSeconds + idleTime
+            local weight = max(0.6, min(2.5, idleTime / max(0.5, idleGrace)))
+            summary.weightedIdleMistakes = summary.weightedIdleMistakes + weight
+
+            tinsert(summary.idleSegments, {
+                startTime = busyEnd,
+                endTime = nextEv.t or busyEnd,
+                duration = idleTime,
+            })
+
+            tinsert(syntheticIdles, {
+                t = busyEnd,
+                spellID = 0,
+                spellName = "Idle GCD Gap",
+                spellIcon = nil,
+                outcome = "IDLE_GAP",
+                isSyntheticEvent = true,
+                isSyntheticIdle = true,
+                powerType = summary.primaryPowerType or 0,
+                powerBefore = 0,
+                powerAfter = 0,
+                powerMax = 100,
+                spellCost = 0,
+                burstSize = 1,
+                pressCount = 1,
+                idleSeconds = idleTime,
+                rawGapSeconds = rawGap,
+                verdict = VERDICTS.IDLE_GAP,
+                note = format(
+                    "Idle gap: %.1fs dead time (%.1fs between %s -> %s)",
+                    idleTime,
+                    rawGap,
+                    prevEv.spellName or "cast",
+                    nextEv.spellName or "cast"
+                ),
+            })
+        end
+    end
+
+    if #syntheticIdles > 0 then
+        for i = 1, #syntheticIdles do
+            tinsert(fight.events, syntheticIdles[i])
+        end
+        sort(fight.events, SortByTimestamp)
+    end
+end
+
 local function CalculateFightScore(summary, totalSteps)
     if totalSteps <= 0 then
         return 100
     end
 
-    local earlyPenalty = summary.weightedEarlyMistakes * 7.5
-    local latePenalty = summary.weightedLateMistakes * 5.5
-    local overcapPenalty = summary.weightedOvercapMistakes * 6.5
+    local earlyPenalty = (summary.weightedEarlyMistakes or 0) * 7.5
+    local latePenalty = (summary.weightedLateMistakes or 0) * 5.5
+    local overcapPenalty = (summary.weightedOvercapMistakes or 0) * 6.5
+    local idlePenalty = (summary.weightedIdleMistakes or 0) * 5.0
 
-    local rawDeduction = earlyPenalty + latePenalty + overcapPenalty
+    local rawDeduction = earlyPenalty + latePenalty + overcapPenalty + idlePenalty
     local scale = max(1.0, totalSteps / 18.0)
     local normalizedDeduction = rawDeduction / scale
 
@@ -565,6 +674,8 @@ function Analyzer:AnalyzeFight(fight, customThresholds)
             or DEFAULT_THRESHOLDS.hoardMultiplier,
         hoardHoldSeconds = (customThresholds and customThresholds.hoardHoldSeconds)
             or DEFAULT_THRESHOLDS.hoardHoldSeconds,
+        idleGapSeconds = (customThresholds and customThresholds.idleGapSeconds)
+            or DEFAULT_THRESHOLDS.idleGapSeconds,
         spamDebounceSeconds = (customThresholds and customThresholds.spamDebounceSeconds)
             or DEFAULT_THRESHOLDS.spamDebounceSeconds,
     }
@@ -657,14 +768,23 @@ function Analyzer:AnalyzeFight(fight, customThresholds)
             local presses = ev.pressCount or 1
             ev.verdict = VERDICTS.EARLY_STARVED
             ev.deficit = deficit
-            ev.note = format(
-                "Too early: short %d %s (%d/%d)%s",
-                deficit,
-                profile.name,
-                pBefore,
-                cost,
-                presses > 1 and format(" — pressed %dx", presses) or ""
-            )
+            if ev.powerIsSecret then
+                ev.note = format(
+                    "Too early: insufficient %s (cost %d)%s",
+                    profile.name,
+                    cost,
+                    presses > 1 and format(" — pressed %dx", presses) or ""
+                )
+            else
+                ev.note = format(
+                    "Too early: short %d %s (%d/%d)%s",
+                    deficit,
+                    profile.name,
+                    pBefore,
+                    cost,
+                    presses > 1 and format(" — pressed %dx", presses) or ""
+                )
+            end
 
             summary.earlyStarvedCount = summary.earlyStarvedCount + 1
             local mashWeight = 1.0 + 0.25 * min(4, presses - 1)
@@ -721,7 +841,7 @@ function Analyzer:AnalyzeFight(fight, customThresholds)
 
         else
             local isHoard = false
-            if ev.outcome == "SUCCEEDED" and cost > 0 and profile.allowHoardCheck and pMax > 0 then
+            if ev.outcome == "SUCCEEDED" and cost > 0 and profile.allowHoardCheck and pMax > 0 and not ev.powerIsSecret then
                 local refCost = max(cost, refSpenderCosts[pType] or cost)
                 local multThresh = refCost * thresholds.hoardMultiplier
                 local ratioThresh = pMax * profile.minCapRatio
@@ -801,15 +921,28 @@ function Analyzer:AnalyzeFight(fight, customThresholds)
                             cpSuffix
                         )
                     elseif cost > 0 then
-                        ev.note = format(
-                            "Efficient spend (%d -> %d %s)%s",
-                            pBefore,
-                            ev.powerAfter or max(0, pBefore - cost),
-                            profile.name,
-                            cpSuffix
-                        )
+                        if ev.powerIsSecret then
+                            ev.note = format(
+                                "Cast (%d %s cost — live pool masked)%s",
+                                cost,
+                                profile.name,
+                                cpSuffix
+                            )
+                        else
+                            ev.note = format(
+                                "Efficient spend (%d -> %d %s)%s",
+                                pBefore,
+                                ev.powerAfter or max(0, pBefore - cost),
+                                profile.name,
+                                cpSuffix
+                            )
+                        end
                     else
-                        ev.note = format("Clean cast (%d %s)%s", pBefore, profile.name, cpSuffix)
+                        if ev.powerIsSecret then
+                            ev.note = format("Clean cast (live %s masked)%s", profile.name, cpSuffix)
+                        else
+                            ev.note = format("Clean cast (%d %s)%s", pBefore, profile.name, cpSuffix)
+                        end
                     end
                 end
             end
@@ -822,11 +955,13 @@ function Analyzer:AnalyzeFight(fight, customThresholds)
 
     AnalyzeHunterPetTelemetry(fight, summary)
     AnalyzeShamanTotemTelemetry(fight, summary)
+    AnalyzeCastTempoAndIdleGaps(fight, summary, thresholds)
 
     local totalSteps = summary.efficientCount
         + summary.earlyStarvedCount
         + summary.lateHoardCount
         + summary.overcapWasteCount
+        + (summary.idleGapCount or 0)
 
     fight.summary = summary
     fight.score = CalculateFightScore(summary, totalSteps)
@@ -841,12 +976,14 @@ local REPORT_VERDICT_LABEL = {
     EARLY_STARVED = "Early",
     LATE_HOARD = "Late",
     OVERCAP_WASTE = "Overcap",
+    IDLE_GAP = "Idle",
 }
 
 local REPORT_VERDICT_COLOR = {
     EARLY_STARVED = "|cfff04047",
     LATE_HOARD = "|cfff5ad24",
     OVERCAP_WASTE = "|cffd159eb",
+    IDLE_GAP = "|cfff28538",
 }
 
 local function FormatReportClock(sec)
@@ -882,10 +1019,15 @@ function Analyzer:BuildChatReport(fight, useColor)
         end
     end
 
+    local tempoStat = ""
+    if sum.activeUptimePct ~= nil then
+        tempoStat = format(" | Uptime: %d%% (%.1f CPM)", sum.activeUptimePct or 0, sum.cpm or 0)
+    end
+
     if useColor then
         local scoreHex = (score >= 88 and "|cff2ed16b") or (score >= 70 and "|cfff5ad24") or "|cfff04047"
         tinsert(lines, format(
-            "|cff5cc8ff[CTE]|r %s (%s) — Score: %s%d%%|r | |cff2ed16b%d Eff|r, |cfff04047%d Early|r, |cfff5ad24%d Late|r, |cffd159eb%d Overcap|r%s",
+            "|cff5cc8ff[CTE]|r %s (%s) — Score: %s%d%%|r | |cff2ed16b%d Eff|r, |cfff04047%d Early|r, |cfff5ad24%d Late|r, |cffd159eb%d Overcap|r, |cfff28538%d Idle|r%s%s",
             fight.targetName or "Encounter",
             FormatReportClock(fight.duration),
             scoreHex,
@@ -894,11 +1036,13 @@ function Analyzer:BuildChatReport(fight, useColor)
             sum.earlyStarvedCount or 0,
             sum.lateHoardCount or 0,
             sum.overcapWasteCount or 0,
+            sum.idleGapCount or 0,
+            tempoStat,
             extraStat
         ))
     else
         tinsert(lines, format(
-            "[CTE] %s (%s) - Score: %d%% | %d Efficient, %d Early, %d Late, %d Overcap%s",
+            "[CTE] %s (%s) - Score: %d%% | %d Efficient, %d Early, %d Late, %d Overcap, %d Idle%s%s",
             fight.targetName or "Encounter",
             FormatReportClock(fight.duration),
             score,
@@ -906,6 +1050,8 @@ function Analyzer:BuildChatReport(fight, useColor)
             sum.earlyStarvedCount or 0,
             sum.lateHoardCount or 0,
             sum.overcapWasteCount or 0,
+            sum.idleGapCount or 0,
+            tempoStat,
             extraStat
         ))
     end
@@ -940,6 +1086,8 @@ function Analyzer:BuildChatReport(fight, useColor)
                 weight = 1.2 + ((ev.wastedAmount or 0) / max(1, ev.powerMax or 100))
             elseif ev.verdict == VERDICTS.LATE_HOARD then
                 weight = 1.1 + min(1.5, (ev.heldSeconds or 1.0) * 0.35)
+            elseif ev.verdict == VERDICTS.IDLE_GAP then
+                weight = 1.1 + min(1.8, (ev.idleSeconds or 0.6) * 0.5)
             end
             bucket.impact = bucket.impact + weight
         end

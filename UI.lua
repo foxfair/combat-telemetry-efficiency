@@ -3,6 +3,7 @@ local _, NS = ...
 local CreateFrame = CreateFrame
 local GetTime = GetTime
 local GetCursorPosition = GetCursorPosition
+local IsMouseButtonDown = IsMouseButtonDown
 local GameTooltip = GameTooltip
 local UIParent = UIParent
 local Minimap = Minimap
@@ -19,6 +20,7 @@ local sin = math.sin
 local deg = math.deg
 local rad = math.rad
 local format = string.format
+local tonumber = tonumber
 
 local UI = {}
 NS.UI = UI
@@ -34,6 +36,8 @@ local VISIBLE_LOG_ROWS = 7
 local CURVE_SLICES = 150
 local MINIMAP_RIM_PADDING = 6
 local DEFAULT_MINIMAP_ANGLE = 220
+local DEFAULT_AUTO_FADE_SECONDS = 10.0
+local AUTO_FADE_DURATION = 1.0
 
 local SECONDARY = {
     COMBO_POINTS = 4,
@@ -44,6 +48,7 @@ local SECONDARY = {
 
 local MINIMAP_BUTTON_ICON = "Interface\\Icons\\INV_Misc_PocketWatch_01"
 local OVERCAP_FALLBACK_ICON = "Interface\\Icons\\Spell_Nature_WispSplode"
+local IDLE_FALLBACK_ICON = "Interface\\Icons\\Spell_Holy_BorrowedTime"
 local DEFAULT_SPELL_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 
 local VERDICT_COLORS = {
@@ -51,6 +56,7 @@ local VERDICT_COLORS = {
     EARLY_STARVED = { 0.94, 0.25, 0.28, 1.0 },
     LATE_HOARD = { 0.96, 0.68, 0.14, 1.0 },
     OVERCAP_WASTE = { 0.82, 0.35, 0.92, 1.0 },
+    IDLE_GAP = { 0.95, 0.52, 0.22, 1.0 },
 }
 
 local VERDICT_HEX = {
@@ -58,6 +64,7 @@ local VERDICT_HEX = {
     EARLY_STARVED = "|cfff04047",
     LATE_HOARD = "|cfff5ad24",
     OVERCAP_WASTE = "|cffd159eb",
+    IDLE_GAP = "|cfff28538",
 }
 
 local POWER_BAR_COLORS = {
@@ -116,6 +123,10 @@ local zoomLevel = 1
 local viewStart = 0
 local viewEnd = 1
 local highlightedEventIndex = nil
+local delAllConfirmUntil = 0
+local autoFadeArmed = false
+local autoFadeStartAt = 0
+local autoFadeLastShownSec = -1
 
 local scrubTickPool = {}
 local curveFillPool = {}
@@ -123,6 +134,7 @@ local curveLinePool = {}
 local secCurvePool = {}
 local totemBarPool = {}
 local formRibbonPool = {}
+local idleBandPool = {}
 local dashLinePool = {}
 local axisLabelPool = {}
 local pinPool = {}
@@ -472,6 +484,37 @@ function UI:InitMinimapButton()
     self:UpdateMinimapButton()
 end
 
+local function CancelAutoFade()
+    if not autoFadeArmed then
+        return
+    end
+    autoFadeArmed = false
+    autoFadeStartAt = 0
+    autoFadeLastShownSec = -1
+    if mainFrame then
+        mainFrame:SetAlpha(1.0)
+        if mainFrame.fadeStatusText then
+            mainFrame.fadeStatusText:SetText("")
+            mainFrame.fadeStatusText:Hide()
+        end
+    end
+end
+
+local function ArmAutoFade(timeoutSec)
+    if not mainFrame then
+        return
+    end
+    local sec = max(3.0, min(30.0, tonumber(timeoutSec) or DEFAULT_AUTO_FADE_SECONDS))
+    autoFadeArmed = true
+    autoFadeStartAt = GetTime() + sec
+    autoFadeLastShownSec = -1
+    mainFrame:SetAlpha(1.0)
+    if mainFrame.fadeStatusText then
+        mainFrame.fadeStatusText:SetText(format("|cff88929eAuto-fade: %ds (click to keep)|r", floor(sec + 0.5)))
+        mainFrame.fadeStatusText:Show()
+    end
+end
+
 local function SyncSettingsPopover()
     if not settingsPopover or not NS.Addon or not NS.Addon.db then
         return
@@ -480,6 +523,9 @@ local function SyncSettingsPopover()
     isSyncingSettings = true
     settingsPopover.multSlider:SetDisplayValue(db.thresholds.hoardMultiplier or 2.0)
     settingsPopover.holdSlider:SetDisplayValue(db.thresholds.hoardHoldSeconds or 1.0)
+    settingsPopover.idleSlider:SetDisplayValue(db.thresholds.idleGapSeconds or 0.6)
+    settingsPopover.autoShowCheck:SetCheckedState(db.autoShowAfterCombat ~= false)
+    settingsPopover.fadeSlider:SetDisplayValue(db.autoFadeSeconds or DEFAULT_AUTO_FADE_SECONDS)
     settingsPopover.bannerCheck:SetCheckedState(db.showPostCombatBanner ~= false)
     settingsPopover.bossCheck:SetCheckedState(db.bossOnly == true)
     settingsPopover.minimapCheck:SetCheckedState(not (db.minimap and db.minimap.hide))
@@ -489,7 +535,7 @@ end
 local function ToggleSettingsPopover(anchor)
     if not settingsPopover then
         local pop = CreateFrame("Frame", nil, mainFrame, BACKDROP_TEMPLATE)
-        pop:SetSize(264, 264)
+        pop:SetSize(264, 392)
         pop:SetFrameStrata("FULLSCREEN_DIALOG")
         pop:EnableMouse(true)
         ApplyPanelBackdrop(pop, 0.98, 0.34, 0.66, 0.94, 1.0)
@@ -548,11 +594,60 @@ local function ToggleSettingsPopover(anchor)
         holdSlider:SetPoint("TOPLEFT", multSlider, "BOTTOMLEFT", 0, -8)
         pop.holdSlider = holdSlider
 
+        local idleSlider = CreateCompactSlider(
+            pop,
+            238,
+            "Idle GCD Grace Period",
+            0.2,
+            5.0,
+            0.1,
+            "%.1fs",
+            function(val)
+                if NS.Addon and NS.Addon.db then
+                    NS.Addon.db.thresholds.idleGapSeconds = val
+                    NS.Addon:ReanalyzeAllFights()
+                end
+            end
+        )
+        idleSlider:SetPoint("TOPLEFT", holdSlider, "BOTTOMLEFT", 0, -8)
+        pop.idleSlider = idleSlider
+
         local divider = pop:CreateTexture(nil, "ARTWORK")
         divider:SetHeight(1)
-        divider:SetPoint("TOPLEFT", holdSlider, "BOTTOMLEFT", 0, -6)
+        divider:SetPoint("TOPLEFT", idleSlider, "BOTTOMLEFT", 0, -6)
         divider:SetWidth(238)
         divider:SetColorTexture(0.24, 0.27, 0.33, 1.0)
+
+        local autoShowCheck = CreateCompactCheckbox(
+            pop,
+            238,
+            "Auto-Open & Fade After Combat",
+            "Closes if not clicked before timeout",
+            function(checked)
+                if NS.Addon and NS.Addon.db then
+                    NS.Addon.db.autoShowAfterCombat = checked
+                end
+            end
+        )
+        autoShowCheck:SetPoint("TOPLEFT", divider, "BOTTOMLEFT", 0, -8)
+        pop.autoShowCheck = autoShowCheck
+
+        local fadeSlider = CreateCompactSlider(
+            pop,
+            238,
+            "Auto-Fade Timeout",
+            3.0,
+            30.0,
+            1.0,
+            "%.0fs",
+            function(val)
+                if NS.Addon and NS.Addon.db then
+                    NS.Addon.db.autoFadeSeconds = val
+                end
+            end
+        )
+        fadeSlider:SetPoint("TOPLEFT", autoShowCheck, "BOTTOMLEFT", 0, -6)
+        pop.fadeSlider = fadeSlider
 
         local bannerCheck = CreateCompactCheckbox(
             pop,
@@ -565,7 +660,7 @@ local function ToggleSettingsPopover(anchor)
                 end
             end
         )
-        bannerCheck:SetPoint("TOPLEFT", divider, "BOTTOMLEFT", 0, -8)
+        bannerCheck:SetPoint("TOPLEFT", fadeSlider, "BOTTOMLEFT", 0, -6)
         pop.bannerCheck = bannerCheck
 
         local bossCheck = CreateCompactCheckbox(
@@ -604,7 +699,10 @@ local function ToggleSettingsPopover(anchor)
                 local defs = NS.Addon.DEFAULT_DB
                 NS.Addon.db.thresholds.hoardMultiplier = defs and defs.thresholds.hoardMultiplier or 2.0
                 NS.Addon.db.thresholds.hoardHoldSeconds = defs and defs.thresholds.hoardHoldSeconds or 1.0
+                NS.Addon.db.thresholds.idleGapSeconds = defs and defs.thresholds.idleGapSeconds or 0.6
                 NS.Addon.db.showPostCombatBanner = true
+                NS.Addon.db.autoShowAfterCombat = true
+                NS.Addon.db.autoFadeSeconds = DEFAULT_AUTO_FADE_SECONDS
                 NS.Addon.db.bossOnly = false
                 NS.Addon.db.minimap.hide = false
                 NS.Addon.db.minimap.angle = DEFAULT_MINIMAP_ANGLE
@@ -840,6 +938,50 @@ local function SampleSecondaryAtTime(secSamples, secType, t)
         end
     end
     return lastVal or 0, lastMax, lastExtra
+end
+
+
+local function SampleTempoAtTime(events, t, windowHalf)
+    if not events or #events == 0 then
+        return 0
+    end
+    local half = windowHalf or 2.0
+    local wStart = t - half
+    local wEnd = t + half
+    local wSpan = max(0.5, wEnd - wStart)
+
+    -- Compute fraction of the sliding window covered by active GCD/cast intervals
+    local active = 0
+    local curS = nil
+    local curE = nil
+
+    for i = 1, #events do
+        local ev = events[i]
+        if not ev.isSyntheticEvent and ev.outcome == "SUCCEEDED" then
+            local evStart = ev.t or 0
+            local evEnd = evStart + max(1.5, ev.castTime or 0)
+            if evEnd >= wStart and evStart <= wEnd then
+                local cs = max(wStart, evStart)
+                local ce = min(wEnd, evEnd)
+                if curS == nil then
+                    curS = cs
+                    curE = ce
+                elseif cs <= curE then
+                    if ce > curE then
+                        curE = ce
+                    end
+                else
+                    active = active + (curE - curS)
+                    curS = cs
+                    curE = ce
+                end
+            end
+        end
+    end
+    if curS ~= nil then
+        active = active + (curE - curS)
+    end
+    return max(0, min(1, active / wSpan))
 end
 
 local function EnsureNotificationPill()
@@ -1206,6 +1348,9 @@ local function RenderBand2(fight)
     for i = 1, #formRibbonPool do
         formRibbonPool[i]:Hide()
     end
+    for i = 1, #idleBandPool do
+        idleBandPool[i]:Hide()
+    end
     for i = 1, #dashLinePool do
         dashLinePool[i]:Hide()
     end
@@ -1233,27 +1378,60 @@ local function RenderBand2(fight)
     local hasFormRibbon = RenderDruidFormRibbon(canvas, fight, plotW, span)
     local topStripOffset = hasFormRibbon and 8 or 2
 
+    -- Shaded vertical zones for detected Idle GCD Gaps
+    local idleSegs = fight.summary and fight.summary.idleSegments
+    if idleSegs and #idleSegs > 0 then
+        local bandIdx = 0
+        for i = 1, #idleSegs do
+            local seg = idleSegs[i]
+            local visStart = max(viewStart, seg.startTime or 0)
+            local visEnd = min(viewEnd, seg.endTime or 0)
+            if visEnd > visStart then
+                bandIdx = bandIdx + 1
+                local tex = idleBandPool[bandIdx]
+                if not tex then
+                    tex = canvas:CreateTexture(nil, "BACKGROUND")
+                    idleBandPool[bandIdx] = tex
+                end
+                local xLeft = ((visStart - viewStart) / span) * plotW
+                local segW = max(2, ((visEnd - visStart) / span) * plotW)
+                tex:ClearAllPoints()
+                tex:SetPoint("BOTTOMLEFT", canvas, "BOTTOMLEFT", xLeft, 1)
+                tex:SetSize(segW, plotH - 2)
+                tex:SetColorTexture(0.95, 0.42, 0.18, 0.16)
+                tex:Show()
+            end
+        end
+    end
+
+    local useTempoCurve = (fight.secretPowerDrops or 0) > 0
     local sampleMax = 100
     if viewLayerMode ~= "SECONDARY" then
         local sliceW = plotW / CURVE_SLICES
         for i = 1, CURVE_SLICES do
             local sampleT = viewStart + (((i - 0.5) / CURVE_SLICES) * span)
-            local slicePowerType = primaryPowerType
+            local ratio = 0
             local sliceRGB = barRGB
 
-            if isMultiFormDruid then
-                local seg = GetFormSegmentAtTime(fight.formSegments, sampleT)
-                if seg then
-                    slicePowerType = seg.powerType
-                    sliceRGB = DRUID_FORM_COLORS[seg.form] or barRGB
+            if useTempoCurve then
+                ratio = SampleTempoAtTime(fight.events, sampleT, 2.0)
+                sliceRGB = { 0.24, 0.78, 0.92 }
+            else
+                local slicePowerType = primaryPowerType
+                if isMultiFormDruid then
+                    local seg = GetFormSegmentAtTime(fight.formSegments, sampleT)
+                    if seg then
+                        slicePowerType = seg.powerType
+                        sliceRGB = DRUID_FORM_COLORS[seg.form] or barRGB
+                    end
                 end
+                local pVal, pMax = SamplePrimaryAtTime(fight.samples, slicePowerType, sampleT)
+                if pMax > 0 then
+                    sampleMax = pMax
+                end
+                ratio = max(0, min(1, pVal / max(1, pMax)))
             end
 
-            local pVal, pMax = SamplePrimaryAtTime(fight.samples, slicePowerType, sampleT)
-            if pMax > 0 then
-                sampleMax = pMax
-            end
-            local ratio = max(0, min(1, pVal / max(1, pMax)))
             local barH = max(1, ratio * (plotH - 8))
             local xLeft = (i - 1) * sliceW
 
@@ -1288,7 +1466,9 @@ local function RenderBand2(fight)
     end
 
     local legend = mainFrame.band2.legendLabel
-    if isMultiFormDruid then
+    if useTempoCurve then
+        legend:SetText("|cff3dc7ebCurve: Rolling GCD Tempo %|r  |  |cfff28538Shaded: Idle Gaps|r  |cff88929e(1.60.1 live pool masked)|r")
+    elseif isMultiFormDruid then
         legend:SetText("|cffe03838Bear|r / |cfff5d62eCat+CP|r / |cff8f6bf5Moonkin|r / |cff297af5Caster|r")
     else
         local pName = (fight.summary and fight.summary.primaryPowerName) or "Resource"
@@ -1310,7 +1490,7 @@ local function RenderBand2(fight)
     legend:Show()
 
     local hoardThresh = fight.summary and fight.summary.hoardThreshold or 0
-    if viewLayerMode ~= "SECONDARY" and hoardThresh > 0 and sampleMax > 0 and hoardThresh < sampleMax then
+    if not useTempoCurve and viewLayerMode ~= "SECONDARY" and hoardThresh > 0 and sampleMax > 0 and hoardThresh < sampleMax then
         local threshRatio = max(0.05, min(0.96, hoardThresh / sampleMax))
         local threshY = threshRatio * (plotH - 8)
         local dashCount = 34
@@ -1385,7 +1565,14 @@ local function RenderBand2(fight)
         xCenter = max(iconSize * 0.5 + 2, min(plotW - iconSize * 0.5 - 2, xCenter))
 
         local baseEv = cluster.items[1].ev
-        local pRatio = max(0, min(1, (baseEv.powerBefore or 0) / max(1, baseEv.powerMax or sampleMax)))
+        local pRatio
+        if useTempoCurve then
+            pRatio = baseEv.isSyntheticIdle and 0.18 or SampleTempoAtTime(fight.events, cluster.t, 2.0)
+        elseif baseEv.isSyntheticIdle then
+            pRatio = 0.18
+        else
+            pRatio = max(0, min(1, (baseEv.powerBefore or 0) / max(1, baseEv.powerMax or sampleMax)))
+        end
         local baseY = max(4, min(plotH - iconSize - 8, pRatio * (plotH - iconSize - 12) + 4))
         local stackDir = (baseY + (stackSize * (iconSize + 2)) > plotH - 8) and -1 or 1
 
@@ -1498,7 +1685,10 @@ local function RenderBand2(fight)
             local cBorder = GetVerdictColor(ev.verdict)
             ApplyPanelBackdrop(pin, 1.0, cBorder[1], cBorder[2], cBorder[3], 1.0)
 
-            local texPath = ev.spellIcon or (ev.isSyntheticOvercap and OVERCAP_FALLBACK_ICON) or DEFAULT_SPELL_ICON
+            local texPath = ev.spellIcon
+                or (ev.isSyntheticIdle and IDLE_FALLBACK_ICON)
+                or (ev.isSyntheticOvercap and OVERCAP_FALLBACK_ICON)
+                or DEFAULT_SPELL_ICON
             pin.icon:SetTexture(texPath)
 
             if (ev.pressCount or 1) > 1 and not ev.isSyntheticOvercap then
@@ -1628,7 +1818,10 @@ local function RenderBand3(fight)
 
             row.timeTxt:SetText(FormatClock(ev.t))
             row.icon:SetTexture(
-                ev.spellIcon or (ev.isSyntheticOvercap and OVERCAP_FALLBACK_ICON) or DEFAULT_SPELL_ICON
+                ev.spellIcon
+                    or (ev.isSyntheticIdle and IDLE_FALLBACK_ICON)
+                    or (ev.isSyntheticOvercap and OVERCAP_FALLBACK_ICON)
+                    or DEFAULT_SPELL_ICON
             )
 
             local prefix = ""
@@ -1649,8 +1842,16 @@ local function RenderBand3(fight)
             row.spellTxt:SetText(prefix .. (ev.spellName or "Ability") .. badges)
 
             local resStr
-            if ev.isSyntheticOvercap then
+            if ev.isSyntheticIdle then
+                resStr = format("|cfff28538-%.1fs idle|r", ev.idleSeconds or 0)
+            elseif ev.isSyntheticOvercap then
                 resStr = format("%d/%d", ev.powerBefore or 0, ev.powerMax or 100)
+            elseif ev.powerIsSecret then
+                if (ev.spellCost or 0) > 0 then
+                    resStr = format("|cff88929eSecret|r (-%d)", ev.spellCost)
+                else
+                    resStr = "|cff88929eSecret|r"
+                end
             else
                 resStr = format("%d->%d", ev.powerBefore or 0, ev.powerAfter or 0)
             end
@@ -1701,6 +1902,12 @@ function UI:Refresh()
         end
         if mainFrame.delBtn then
             mainFrame.delBtn:SetEnabled(false)
+        end
+        if mainFrame.delAllBtn then
+            delAllConfirmUntil = 0
+            mainFrame.delAllBtn:SetActiveState(false)
+            mainFrame.delAllBtn.label:SetText("Delete All")
+            mainFrame.delAllBtn:SetEnabled(false)
         end
         if mainFrame.filterChips then
             for key, chip in pairs(mainFrame.filterChips) do
@@ -1755,12 +1962,18 @@ function UI:Refresh()
             end
         end
 
+        local tempoTag = ""
+        if sum.activeUptimePct ~= nil then
+            tempoTag = format("  |  |cff5cc8ffUptime %d%% (%.1f CPM)|r", sum.activeUptimePct or 0, sum.cpm or 0)
+        end
         mainFrame.summaryText:SetText(format(
-            "|cff2ed16b%d Efficient|r  |  |cfff04047%d Early|r  |  |cfff5ad24%d Late|r  |  |cffd159eb%d Overcap|r%s",
+            "|cff2ed16b%d Eff|r | |cfff04047%d Early|r | |cfff5ad24%d Late|r | |cffd159eb%d Over|r | |cfff28538%d Idle|r%s%s",
             sum.efficientCount or 0,
             sum.earlyStarvedCount or 0,
             sum.lateHoardCount or 0,
             sum.overcapWasteCount or 0,
+            sum.idleGapCount or 0,
+            tempoTag,
             extraStat
         ))
     else
@@ -1790,13 +2003,22 @@ function UI:Refresh()
     if mainFrame.delBtn then
         mainFrame.delBtn:SetEnabled(true)
     end
+    if mainFrame.delAllBtn then
+        mainFrame.delAllBtn:SetEnabled(true)
+        if delAllConfirmUntil <= GetTime() then
+            delAllConfirmUntil = 0
+            mainFrame.delAllBtn:SetActiveState(false)
+            mainFrame.delAllBtn.label:SetText("Delete All")
+        end
+    end
 
     if mainFrame.filterChips then
         local totalAll = #(fight.events or {})
         local earlyCnt = (sum and sum.earlyStarvedCount) or 0
         local lateCnt = (sum and sum.lateHoardCount) or 0
         local overcapCnt = (sum and sum.overcapWasteCount) or 0
-        local issuesCnt = earlyCnt + lateCnt + overcapCnt
+        local idleCnt = (sum and sum.idleGapCount) or 0
+        local issuesCnt = earlyCnt + lateCnt + overcapCnt + idleCnt
 
         local counts = {
             ALL = totalAll,
@@ -1804,6 +2026,7 @@ function UI:Refresh()
             EARLY_STARVED = earlyCnt,
             LATE_HOARD = lateCnt,
             OVERCAP_WASTE = overcapCnt,
+            IDLE_GAP = idleCnt,
         }
         for key, chip in pairs(mainFrame.filterChips) do
             local cnt = counts[key] or 0
@@ -1928,9 +2151,60 @@ local function EnsureMainFrame()
     f:SetMovable(true)
     f:EnableMouse(true)
     f:RegisterForDrag("LeftButton")
-    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnMouseDown", function()
+        CancelAutoFade()
+    end)
+    f:SetScript("OnDragStart", function(self)
+        CancelAutoFade()
+        self:StartMoving()
+    end)
     f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    f:SetScript("OnUpdate", function(self)
+        if not autoFadeArmed then
+            return
+        end
+
+        -- Any click inside the CTE window (including child buttons, tabs, or log rows) locks it open
+        if IsMouseButtonDown and self:IsMouseOver() and (IsMouseButtonDown("LeftButton") or IsMouseButtonDown("RightButton")) then
+            CancelAutoFade()
+            return
+        end
+
+        -- If the user opened any child popover, lock the window open
+        if (settingsPopover and settingsPopover:IsShown())
+            or (reportPopover and reportPopover:IsShown())
+            or (fightMenuFrame and fightMenuFrame:IsShown())
+        then
+            CancelAutoFade()
+            return
+        end
+
+        local now = GetTime()
+        local remaining = autoFadeStartAt - now
+        if remaining > 0 then
+            local wholeSec = floor(remaining + 0.999)
+            if wholeSec ~= autoFadeLastShownSec then
+                autoFadeLastShownSec = wholeSec
+                if self.fadeStatusText then
+                    self.fadeStatusText:SetText(format("|cff88929eAuto-fade: %ds (click to keep)|r", wholeSec))
+                    self.fadeStatusText:Show()
+                end
+            end
+            return
+        end
+
+        local elapsedFade = now - autoFadeStartAt
+        if elapsedFade >= AUTO_FADE_DURATION then
+            CancelAutoFade()
+            self:Hide()
+            return
+        end
+
+        local alpha = max(0, 1.0 - (elapsedFade / AUTO_FADE_DURATION))
+        self:SetAlpha(alpha)
+    end)
     f:SetScript("OnHide", function()
+        CancelAutoFade()
         if fightMenuFrame then
             fightMenuFrame:Hide()
         end
@@ -1945,6 +2219,11 @@ local function EnsureMainFrame()
         end
         if f.reportBtn then
             f.reportBtn:SetActiveState(false)
+        end
+        delAllConfirmUntil = 0
+        if f.delAllBtn then
+            f.delAllBtn:SetActiveState(false)
+            f.delAllBtn.label:SetText("Delete All")
         end
     end)
     ApplyPanelBackdrop(f, 0.96, 0.26, 0.30, 0.36, 1.0)
@@ -2050,8 +2329,52 @@ local function EnsureMainFrame()
     summaryText:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -36)
     f.summaryText = summaryText
 
+    local delAllBtn = CreateActionButton(f, 64, 18, "Delete All")
+    delAllBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -12, -33)
+    delAllBtn:SetScript("OnEnter", function(self)
+        if self:IsEnabled() and delAllConfirmUntil <= GetTime() then
+            self:SetBackdropBorderColor(0.94, 0.30, 0.32, 1.0)
+            self.label:SetTextColor(1.0, 0.55, 0.55)
+        end
+    end)
+    delAllBtn:SetScript("OnLeave", function(self)
+        if delAllConfirmUntil <= GetTime() then
+            self:SetBackdropBorderColor(0.28, 0.31, 0.36, 1.0)
+            self.label:SetTextColor(0.86, 0.89, 0.93)
+        end
+    end)
+    delAllBtn:SetScript("OnUpdate", function(self)
+        if delAllConfirmUntil > 0 and GetTime() >= delAllConfirmUntil then
+            delAllConfirmUntil = 0
+            self:SetActiveState(false)
+            self.label:SetText("Delete All")
+        end
+    end)
+    delAllBtn:SetScript("OnClick", function(self)
+        if delAllConfirmUntil > GetTime() then
+            delAllConfirmUntil = 0
+            self:SetActiveState(false)
+            self.label:SetText("Delete All")
+            if NS.Addon and NS.Addon.ClearHistory then
+                NS.Addon:ClearHistory(true)
+                selectedFightIndex = 1
+                verdictFilter = "ALL"
+                highlightedEventIndex = nil
+                SetViewportRange(GetActiveFight(), 0, 1)
+                UI:Refresh()
+            end
+        else
+            delAllConfirmUntil = GetTime() + 3.0
+            self:SetActiveState(true)
+            self:SetBackdropColor(0.45, 0.10, 0.12, 1.0)
+            self:SetBackdropBorderColor(0.96, 0.28, 0.30, 1.0)
+            self.label:SetText("|cffff6666Confirm?|r")
+        end
+    end)
+    f.delAllBtn = delAllBtn
+
     local delBtn = CreateActionButton(f, 44, 18, "Delete")
-    delBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -12, -33)
+    delBtn:SetPoint("RIGHT", delAllBtn, "LEFT", -4, 0)
     delBtn:SetScript("OnEnter", function(self)
         if self:IsEnabled() then
             self:SetBackdropBorderColor(0.94, 0.30, 0.32, 1.0)
@@ -2081,6 +2404,12 @@ local function EnsureMainFrame()
         end
     end)
     f.pinBtn = pinBtn
+
+    local fadeStatusText = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    fadeStatusText:SetPoint("RIGHT", pinBtn, "LEFT", -10, 0)
+    fadeStatusText:SetJustifyH("RIGHT")
+    fadeStatusText:Hide()
+    f.fadeStatusText = fadeStatusText
 
     local band1 = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
     band1:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -54)
@@ -2179,6 +2508,7 @@ local function EnsureMainFrame()
     band2.legendLabel = legendLabel
 
     canvas:SetScript("OnMouseWheel", function(self, delta)
+        CancelAutoFade()
         local fight = GetActiveFight()
         if not fight then
             return
@@ -2209,11 +2539,12 @@ local function EnsureMainFrame()
     filterLabel:SetText("|cff88929eFilter:|r")
 
     local FILTER_DEFS = {
-        { key = "ALL",           label = "All",     width = 70, rgb = { 0.35, 0.72, 0.98 } },
-        { key = "ISSUES",        label = "Issues",  width = 82, rgb = { 0.96, 0.56, 0.22 } },
-        { key = "EARLY_STARVED", label = "Early",   width = 76, rgb = { 0.94, 0.25, 0.28 } },
-        { key = "LATE_HOARD",    label = "Late",    width = 72, rgb = { 0.96, 0.68, 0.14 } },
-        { key = "OVERCAP_WASTE", label = "Overcap", width = 88, rgb = { 0.82, 0.35, 0.92 } },
+        { key = "ALL",           label = "All",     width = 66, rgb = { 0.35, 0.72, 0.98 } },
+        { key = "ISSUES",        label = "Issues",  width = 78, rgb = { 0.96, 0.56, 0.22 } },
+        { key = "EARLY_STARVED", label = "Early",   width = 72, rgb = { 0.94, 0.25, 0.28 } },
+        { key = "LATE_HOARD",    label = "Late",    width = 68, rgb = { 0.96, 0.68, 0.14 } },
+        { key = "OVERCAP_WASTE", label = "Overcap", width = 82, rgb = { 0.82, 0.35, 0.92 } },
+        { key = "IDLE_GAP",      label = "Idle",    width = 68, rgb = { 0.95, 0.52, 0.22 } },
     }
 
     f.filterChips = {}
@@ -2294,6 +2625,8 @@ end
 
 function UI:Show()
     local f = EnsureMainFrame()
+    CancelAutoFade()
+    f:SetAlpha(1.0)
     selectedFightIndex = 1
     verdictFilter = "ALL"
     highlightedEventIndex = nil
@@ -2330,7 +2663,30 @@ function UI:OpenSettings()
 end
 
 function UI:OnFightRecorded(fight)
-    if NS.Addon and NS.Addon.db and NS.Addon.db.showPostCombatBanner then
+    local db = NS.Addon and NS.Addon.db
+    local autoShow = (not db) or (db.autoShowAfterCombat ~= false)
+
+    if autoShow then
+        local wasManuallyOpen = (mainFrame and mainFrame:IsShown() and not autoFadeArmed)
+        local f = EnsureMainFrame()
+        if pillFrame and pillFrame:IsShown() then
+            pillFrame:Hide()
+        end
+        selectedFightIndex = 1
+        verdictFilter = "ALL"
+        highlightedEventIndex = nil
+        SetViewportRange(fight, 0, 1)
+        f:SetAlpha(1.0)
+        f:Show()
+        self:Refresh()
+
+        if not wasManuallyOpen then
+            ArmAutoFade(db and db.autoFadeSeconds or DEFAULT_AUTO_FADE_SECONDS)
+        end
+        return
+    end
+
+    if db and db.showPostCombatBanner then
         self:ShowPostCombatPill(fight)
     end
     if mainFrame and mainFrame:IsShown() then
