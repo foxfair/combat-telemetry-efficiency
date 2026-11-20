@@ -27,14 +27,15 @@ NS.UI = UI
 
 local BACKDROP_TEMPLATE = BackdropTemplateMixin and "BackdropTemplate" or nil
 
-local DEFAULT_WINDOW_WIDTH = 856
-local DEFAULT_WINDOW_HEIGHT = 524
-local MIN_WINDOW_WIDTH = 760
-local MAX_WINDOW_WIDTH = 1440
-local MIN_WINDOW_HEIGHT = 430
-local MAX_WINDOW_HEIGHT = 980
+local DEFAULT_WINDOW_WIDTH = 880
+local DEFAULT_WINDOW_HEIGHT = 608
+local MIN_WINDOW_WIDTH = 780
+local MAX_WINDOW_WIDTH = 1480
+local MIN_WINDOW_HEIGHT = 510
+local MAX_WINDOW_HEIGHT = 1040
 local BAND1_HEIGHT = 32
-local BASE_BAND2_HEIGHT = 198
+local STREAM_BAND_HEIGHT = 44
+local BASE_BAND2_HEIGHT = 186
 local LOG_ROW_HEIGHT = 22
 local DEFAULT_VISIBLE_LOG_ROWS = 7
 local CURVE_SLICES = 150
@@ -175,6 +176,8 @@ local secCurvePool = {}
 local totemBarPool = {}
 local formRibbonPool = {}
 local idleBandPool = {}
+local streamNodePool = {}
+local streamConnPool = {}
 local dashLinePool = {}
 local axisLabelPool = {}
 local pinPool = {}
@@ -932,10 +935,15 @@ local function ToggleReportPopover(anchor)
 end
 
 local function MatchesVerdictFilter(ev)
+    if not ev then
+        return false
+    end
     if verdictFilter == "ALL" then
         return true
     elseif verdictFilter == "ISSUES" then
-        return ev.verdict ~= nil and ev.verdict ~= "EFFICIENT"
+        return (ev.verdict ~= nil and ev.verdict ~= "EFFICIENT") or (ev.suggestion ~= nil)
+    elseif verdictFilter == "SUGGESTIONS" then
+        return ev.suggestion ~= nil
     else
         return ev.verdict == verdictFilter
     end
@@ -1874,6 +1882,181 @@ local function GetVisibleLogRowCount()
     return DEFAULT_VISIBLE_LOG_ROWS
 end
 
+local function RenderStreamlineStrip(fight)
+    if not mainFrame or not mainFrame.streamBand then
+        return
+    end
+    local sb = mainFrame.streamBand
+
+    for i = 1, #streamNodePool do
+        streamNodePool[i]:Hide()
+    end
+    for i = 1, #streamConnPool do
+        streamConnPool[i]:Hide()
+    end
+
+    if not fight or not fight.events or #fight.events == 0 then
+        sb.emptyText:Show()
+        return
+    end
+    sb.emptyText:Hide()
+
+    local seq = {}
+    for i = 1, #fight.events do
+        local ev = fight.events[i]
+        local t = ev.t or 0
+        if t >= (viewStart - 0.01) and t <= (viewEnd + 0.01) then
+            if (not ev.isSyntheticEvent and ev.outcome == "SUCCEEDED") or ev.isSyntheticIdle then
+                tinsert(seq, ev)
+            end
+        end
+    end
+
+    local innerW = max(200, (sb:GetWidth() or (DEFAULT_WINDOW_WIDTH - 24)) - 16)
+    local nodeSize = 24
+    local connW = 14
+    local stepW = nodeSize + connW
+    local maxNodes = max(6, floor(innerW / stepW))
+
+    local startIdx = 1
+    local endIdx = min(#seq, startIdx + maxNodes - 1)
+    local count = max(0, endIdx - startIdx + 1)
+
+    if count == 0 then
+        sb.emptyText:SetText("No casts in current zoomed window — zoom out (1x) to view full cast streamline.")
+        sb.emptyText:Show()
+        return
+    end
+    sb.emptyText:SetText("Cast sequence streamline will appear here after combat.")
+
+    for idx = 1, count do
+        local ev = seq[startIdx + idx - 1]
+        local xLeft = 8 + ((idx - 1) * stepW)
+
+        if idx < count then
+            local nextEv = seq[startIdx + idx]
+            local conn = streamConnPool[idx]
+            if not conn then
+                conn = CreateFrame("Frame", nil, sb)
+                local line = conn:CreateTexture(nil, "ARTWORK")
+                line:SetHeight(2)
+                line:SetPoint("LEFT", conn, "LEFT", 0, 0)
+                line:SetPoint("RIGHT", conn, "RIGHT", 0, 0)
+                conn.line = line
+
+                local lbl = conn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                lbl:SetPoint("BOTTOM", conn, "TOP", 0, 1)
+                lbl:SetFont(STANDARD_TEXT_FONT, 8, "OUTLINE")
+                conn.lbl = lbl
+                streamConnPool[idx] = conn
+            end
+
+            conn:ClearAllPoints()
+            conn:SetSize(connW, 10)
+            conn:SetPoint("LEFT", sb, "LEFT", xLeft + nodeSize, -4)
+
+            if nextEv.isPreCast then
+                conn.line:SetColorTexture(0.27, 0.88, 0.64, 0.90)
+                conn.lbl:SetText("|cff45e0a2Q|r")
+            elseif nextEv.isSyntheticIdle or nextEv.gapTier == "IDLE" then
+                conn.line:SetColorTexture(0.95, 0.45, 0.20, 0.90)
+                conn.lbl:SetText("|cfff28538!|r")
+            elseif nextEv.gapTier == "BUFFERED" then
+                conn.line:SetColorTexture(0.96, 0.72, 0.22, 0.75)
+                conn.lbl:SetText("")
+            else
+                conn.line:SetColorTexture(0.32, 0.38, 0.46, 0.85)
+                conn.lbl:SetText("")
+            end
+            conn:Show()
+        end
+
+        local node = streamNodePool[idx]
+        if not node then
+            node = CreateFrame("Button", nil, sb, BACKDROP_TEMPLATE)
+            node:SetSize(nodeSize, nodeSize)
+
+            local tex = node:CreateTexture(nil, "ARTWORK")
+            tex:SetPoint("TOPLEFT", 2, -2)
+            tex:SetPoint("BOTTOMRIGHT", -2, 2)
+            tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+            node.icon = tex
+
+            local marker = node:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            marker:SetPoint("TOPRIGHT", node, "TOPRIGHT", 2, 3)
+            marker:SetFont(STANDARD_TEXT_FONT, 9, "OUTLINE")
+            node.marker = marker
+
+            local qTag = node:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            qTag:SetPoint("BOTTOMLEFT", node, "BOTTOMLEFT", -1, -2)
+            qTag:SetFont(STANDARD_TEXT_FONT, 8, "OUTLINE")
+            node.qTag = qTag
+
+            node:SetScript("OnEnter", function(self)
+                if not self.eventData then
+                    return
+                end
+                local d = self.eventData
+                GameTooltip:SetOwner(self, "ANCHOR_TOP")
+                GameTooltip:SetText(format("%s  |cff88929e(%s)|r", d.spellName or "Ability", FormatClock(d.t)))
+                if d.isPreCast then
+                    GameTooltip:AddLine(format("Pre-Cast / Spell-Queued (%.2fs before finish)", d.preCastLead or 0), 0.27, 0.88, 0.64)
+                elseif d.gapTier == "BUFFERED" then
+                    GameTooltip:AddLine(format("Minor reaction delay (+%.2fs) — absorbed by buffer", d.netDelay or 0), 0.96, 0.76, 0.24)
+                end
+                if d.suggestion then
+                    GameTooltip:AddLine("Recommendation: " .. (d.suggestion.summary or d.suggestion.betterSpellName), 1.0, 0.82, 0.25, true)
+                elseif d.note then
+                    GameTooltip:AddLine(d.note, 0.80, 0.85, 0.92, true)
+                end
+                GameTooltip:AddLine("Click to center timeline on this cast", 0.58, 0.65, 0.74)
+                GameTooltip:Show()
+            end)
+            node:SetScript("OnLeave", function()
+                GameTooltip:Hide()
+            end)
+            node:SetScript("OnClick", function(self)
+                local activeFight = GetActiveFight()
+                if activeFight and self.eventData then
+                    CenterViewportOnTime(activeFight, self.eventData.t)
+                    RenderBand1(activeFight)
+                    RenderBand2(activeFight)
+                end
+            end)
+
+            streamNodePool[idx] = node
+        end
+
+        node:ClearAllPoints()
+        node:SetPoint("LEFT", sb, "LEFT", xLeft, -4)
+        node.eventData = ev
+        node.icon:SetTexture(ResolveSpellIcon(ev))
+
+        if ev.suggestion then
+            ApplyPanelBackdrop(node, 1.0, 0.98, 0.76, 0.20, 1.0)
+            node.marker:SetText("|cffffcf4d*|r")
+        elseif ev.isSyntheticIdle then
+            ApplyPanelBackdrop(node, 1.0, 0.95, 0.45, 0.20, 1.0)
+            node.marker:SetText("|cfff28538!|r")
+        elseif ev.verdict ~= "EFFICIENT" then
+            local c = GetVerdictColor(ev.verdict)
+            ApplyPanelBackdrop(node, 1.0, c[1], c[2], c[3], 1.0)
+            node.marker:SetText("|cfff04047!|r")
+        else
+            ApplyPanelBackdrop(node, 1.0, 0.22, 0.76, 0.44, 1.0)
+            node.marker:SetText("")
+        end
+
+        if ev.isPreCast then
+            node.qTag:SetText("|cff45e0a2Q|r")
+        else
+            node.qTag:SetText("")
+        end
+
+        node:Show()
+    end
+end
+
 local function RenderBand3(fight)
     local band3 = mainFrame.band3
     local scrollFrame = band3.scrollFrame
@@ -2036,7 +2219,15 @@ local function RenderBand3(fight)
             row.gapTxt:SetText(format("+%.1fs", gap))
 
             local hex = VERDICT_HEX[ev.verdict] or "|cffffffff"
-            row.noteTxt:SetText(hex .. (ev.note or ev.verdict or "") .. "|r")
+            if ev.suggestion then
+                row.noteTxt:SetText(format(
+                    "|cffffcf4d[Try %s]|r %s",
+                    ev.suggestion.betterSpellName or "Alt",
+                    ev.suggestion.summary or ev.note or ""
+                ))
+            else
+                row.noteTxt:SetText(hex .. (ev.note or ev.verdict or "") .. "|r")
+            end
             row:Show()
         else
             row:Hide()
@@ -2090,7 +2281,11 @@ function UI:Refresh()
                 chip:SetActiveState(verdictFilter == key)
             end
         end
+        if mainFrame.coachingText then
+            mainFrame.coachingText:SetText("|cff88929eCoaching Takeaways:|r Complete a fight to see top priority, reaction buffer, and pre-cast insights.")
+        end
         RenderBand1(nil)
+        RenderStreamlineStrip(nil)
         RenderBand2(nil)
         RenderBand3(nil)
         return
@@ -2203,11 +2398,13 @@ function UI:Refresh()
         local lateCnt = (sum and sum.lateHoardCount) or 0
         local overcapCnt = (sum and sum.overcapWasteCount) or 0
         local idleCnt = (sum and sum.idleGapCount) or 0
-        local issuesCnt = earlyCnt + lateCnt + overcapCnt + idleCnt
+        local sugCnt = (sum and sum.suggestionCount) or 0
+        local issuesCnt = earlyCnt + lateCnt + overcapCnt + idleCnt + sugCnt
 
         local counts = {
             ALL = totalAll,
             ISSUES = issuesCnt,
+            SUGGESTIONS = sugCnt,
             EARLY_STARVED = earlyCnt,
             LATE_HOARD = lateCnt,
             OVERCAP_WASTE = overcapCnt,
@@ -2230,7 +2427,22 @@ function UI:Refresh()
         btn:SetActiveState(zoomLevel == z)
     end
 
+    if mainFrame.coachingText and sum then
+        local tips = sum.takeaways or {}
+        if #tips > 0 then
+            mainFrame.coachingText:SetText("|cffffcf4dTop Insights:|r " .. table.concat(tips, "   |cff55606e•|r   "))
+        else
+            mainFrame.coachingText:SetText(format(
+                "|cff45e0a2Clean Rotation:|r %d pre-cast(s) queued, %d minor delay(s) absorbed by %.2fs buffer, 0 priority swaps flagged.",
+                sum.preCastCount or 0,
+                sum.bufferedDelayCount or 0,
+                sum.reactionBufferSeconds or 0.25
+            ))
+        end
+    end
+
     RenderBand1(fight)
+    RenderStreamlineStrip(fight)
     RenderBand2(fight)
     RenderBand3(fight)
     if compareFrame and compareFrame:IsShown() and UI.RefreshCompareWindow then
@@ -2363,7 +2575,7 @@ local function ApplyMainWindowResponsiveLayout(frame)
 
     -- Scale Band 2 proportionally when taller, leaving generous room for Band 3 rows
     local extraH = h - DEFAULT_WINDOW_HEIGHT
-    local b2H = max(150, min(340, floor(BASE_BAND2_HEIGHT + (extraH * 0.35) + 0.5)))
+    local b2H = max(140, min(320, floor(BASE_BAND2_HEIGHT + (extraH * 0.32) + 0.5)))
     if frame.band2 then
         frame.band2:SetHeight(b2H)
     end
@@ -2815,9 +3027,42 @@ local function EnsureMainFrame()
         RenderBand2(fight)
     end)
 
+    local coachBanner = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
+    coachBanner:SetPoint("TOPLEFT", band1, "BOTTOMLEFT", 0, -5)
+    coachBanner:SetPoint("TOPRIGHT", band1, "BOTTOMRIGHT", 0, -5)
+    coachBanner:SetHeight(22)
+    ApplyPanelBackdrop(coachBanner, 0.94, 0.34, 0.28, 0.16, 0.90)
+    coachBanner:SetBackdropColor(0.14, 0.12, 0.09, 0.94)
+    f.coachBanner = coachBanner
+
+    local coachingText = coachBanner:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    coachingText:SetPoint("LEFT", coachBanner, "LEFT", 8, 0)
+    coachingText:SetPoint("RIGHT", coachBanner, "RIGHT", -8, 0)
+    coachingText:SetJustifyH("LEFT")
+    coachingText:SetWordWrap(false)
+    f.coachingText = coachingText
+
+    local streamBand = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
+    streamBand:SetPoint("TOPLEFT", coachBanner, "BOTTOMLEFT", 0, -5)
+    streamBand:SetPoint("TOPRIGHT", coachBanner, "BOTTOMRIGHT", 0, -5)
+    streamBand:SetHeight(STREAM_BAND_HEIGHT)
+    ApplyPanelBackdrop(streamBand, 0.92, 0.22, 0.25, 0.30, 1.0)
+    f.streamBand = streamBand
+
+    local streamTitle = streamBand:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    streamTitle:SetPoint("TOPLEFT", streamBand, "TOPLEFT", 8, -3)
+    streamTitle:SetFont(STANDARD_TEXT_FONT, 9, "OUTLINE")
+    streamTitle:SetText("|cff88929eCast Streamline:|r  |cff45e0a2[Q] Pre-Cast|r   |cffffcf4d[*] Better Skill Tip|r   |cfff28538[!] Idle/Issue|r")
+
+    local streamEmpty = streamBand:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    streamEmpty:SetPoint("CENTER", streamBand, "CENTER", 0, -4)
+    streamEmpty:SetTextColor(0.55, 0.60, 0.68)
+    streamEmpty:SetText("Cast sequence streamline will appear here after combat.")
+    streamBand.emptyText = streamEmpty
+
     local band2 = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
-    band2:SetPoint("TOPLEFT", band1, "BOTTOMLEFT", 0, -6)
-    band2:SetPoint("TOPRIGHT", band1, "BOTTOMRIGHT", 0, -6)
+    band2:SetPoint("TOPLEFT", streamBand, "BOTTOMLEFT", 0, -5)
+    band2:SetPoint("TOPRIGHT", streamBand, "BOTTOMRIGHT", 0, -5)
     band2:SetHeight(BASE_BAND2_HEIGHT)
     ApplyPanelBackdrop(band2, 0.92, 0.22, 0.25, 0.30, 1.0)
     f.band2 = band2
@@ -2881,12 +3126,13 @@ local function EnsureMainFrame()
     filterLabel:SetText("|cff88929eFilter:|r")
 
     local FILTER_DEFS = {
-        { key = "ALL",           label = "All",     width = 66, rgb = { 0.35, 0.72, 0.98 } },
-        { key = "ISSUES",        label = "Issues",  width = 78, rgb = { 0.96, 0.56, 0.22 } },
-        { key = "EARLY_STARVED", label = "Early",   width = 72, rgb = { 0.94, 0.25, 0.28 } },
-        { key = "LATE_HOARD",    label = "Late",    width = 68, rgb = { 0.96, 0.68, 0.14 } },
-        { key = "OVERCAP_WASTE", label = "Overcap", width = 82, rgb = { 0.82, 0.35, 0.92 } },
-        { key = "IDLE_GAP",      label = "Idle",    width = 68, rgb = { 0.95, 0.52, 0.22 } },
+        { key = "ALL",           label = "All",     width = 62, rgb = { 0.35, 0.72, 0.98 } },
+        { key = "ISSUES",        label = "Issues",  width = 72, rgb = { 0.96, 0.56, 0.22 } },
+        { key = "SUGGESTIONS",   label = "Tips",    width = 66, rgb = { 1.00, 0.81, 0.30 } },
+        { key = "EARLY_STARVED", label = "Early",   width = 68, rgb = { 0.94, 0.25, 0.28 } },
+        { key = "LATE_HOARD",    label = "Late",    width = 64, rgb = { 0.96, 0.68, 0.14 } },
+        { key = "OVERCAP_WASTE", label = "Overcap", width = 76, rgb = { 0.82, 0.35, 0.92 } },
+        { key = "IDLE_GAP",      label = "Idle",    width = 64, rgb = { 0.95, 0.52, 0.22 } },
     }
 
     f.filterChips = {}
