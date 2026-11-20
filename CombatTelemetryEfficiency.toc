@@ -2,12 +2,23 @@
 ## Title: CombatTelemetryEfficiency
 ## Notes: Passive post-combat rotation and resource efficiency analyzer for WoW Forever
 ## Author: foxfair
-## Version: 0.4.0-dev1
+## Version: 0.4.0-dev2
 ## IconTexture: Interface\Icons\INV_Misc_PocketWatch_01
 ## SavedVariables: CombatTelemetryEfficiencyDB
 ## X-Curse-Project-ID: 1815218
 
 Core.lua
 Collector.lua
+Rules\Registry.lua
+Rules\Warrior.lua
+Rules\Druid.lua
+Rules\Priest.lua
+Rules\Hunter.lua
+Rules\Mage.lua
+Rules\Rogue.lua
+Rules\Warlock.lua
+Rules\Shaman.lua
+Rules\Paladin.lua
+Rules\Fallback.lua
 Analyzer.lua
 UI.lua

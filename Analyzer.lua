@@ -730,6 +730,99 @@ local function AnalyzeCastTempoAndIdleGaps(fight, summary, thresholds)
     end
 end
 
+local function EvaluateDecisionRulebook(fight, summary)
+    local events = fight.events or {}
+    local registry = NS.RuleRegistry
+    if not registry then
+        summary.suggestionCount = 0
+        summary.takeaways = {}
+        return
+    end
+
+    local classRules = registry:GetClassRules(fight.playerClass)
+    local genericRules = registry:GetClassRules("GENERIC")
+    local history = registry:BuildSpellHistoryIndex(events)
+    local dur = fight.duration or 0
+    local suggestionCount = 0
+    local groupedTakeaways = {}
+
+    for i = 1, #events do
+        local ev = events[i]
+        ev.suggestion = nil
+        if not ev.isSyntheticEvent and ev.outcome == "SUCCEEDED" then
+            local nextEv = events[i + 1]
+            local poolBefore = (ev.powerIsSecret and ev.estimatedPowerBefore) or ev.powerBefore or 0
+            local ctx = {
+                ev = ev,
+                nextEv = nextEv,
+                poolBefore = poolBefore,
+                poolMax = ev.powerMax or 100,
+                history = history,
+                fightDuration = dur,
+            }
+
+            local sug = nil
+            if classRules and classRules.EvaluateEvent then
+                sug = classRules:EvaluateEvent(ctx)
+            end
+            if not sug and genericRules and genericRules.EvaluateEvent and classRules ~= genericRules then
+                sug = genericRules:EvaluateEvent(ctx)
+            end
+
+            if sug then
+                ev.suggestion = sug
+                suggestionCount = suggestionCount + 1
+
+                local key = (sug.reasonCode or "TIP") .. ":" .. (sug.betterSpellName or "")
+                local grp = groupedTakeaways[key]
+                if not grp then
+                    grp = {
+                        key = key,
+                        reasonCode = sug.reasonCode,
+                        betterSpellName = sug.betterSpellName,
+                        summary = sug.summary,
+                        count = 0,
+                    }
+                    groupedTakeaways[key] = grp
+                end
+                grp.count = grp.count + 1
+            end
+        end
+    end
+
+    summary.suggestionCount = suggestionCount
+
+    -- Build Top-3 ranked actionable takeaways for the fight
+    local ranked = {}
+    for _, grp in pairs(groupedTakeaways) do
+        tinsert(ranked, grp)
+    end
+    sort(ranked, function(a, b)
+        return a.count > b.count
+    end)
+
+    local takeaways = {}
+    for i = 1, min(3, #ranked) do
+        local g = ranked[i]
+        tinsert(takeaways, format("%s (%dx)", g.summary, g.count))
+    end
+    if #takeaways < 3 and (summary.idleGapCount or 0) > 0 then
+        tinsert(takeaways, format(
+            "%d true idle gap(s) totaling %.1fs dead time past %.2fs reaction buffer",
+            summary.idleGapCount,
+            summary.totalIdleSeconds or 0,
+            summary.reactionBufferSeconds or 0.25
+        ))
+    end
+    if #takeaways < 3 and (summary.earlyStarvedCount or 0) > 0 then
+        tinsert(takeaways, format(
+            "%d early starved keypress(es) — wait for resource threshold before pressing",
+            summary.earlyStarvedCount
+        ))
+    end
+    summary.takeaways = takeaways
+end
+
 local function CalculateFightScore(summary, totalSteps)
     if totalSteps <= 0 then
         return 100
@@ -1038,10 +1131,12 @@ function Analyzer:AnalyzeFight(fight, customThresholds)
         end
     end
 
+    summary.reactionBufferSeconds = thresholds.reactionBufferSeconds
     AnalyzeHunterPetTelemetry(fight, summary)
     AnalyzeShamanTotemTelemetry(fight, summary)
     ReconstructShadowResourcePool(fight, summary)
     AnalyzeCastTempoAndIdleGaps(fight, summary, thresholds)
+    EvaluateDecisionRulebook(fight, summary)
 
     local totalSteps = summary.efficientCount
         + summary.earlyStarvedCount
