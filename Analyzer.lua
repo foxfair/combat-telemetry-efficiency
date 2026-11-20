@@ -32,6 +32,7 @@ local SECONDARY = {
 local DEFAULT_THRESHOLDS = {
     hoardMultiplier = 2.0,
     hoardHoldSeconds = 1.0,
+    reactionBufferSeconds = 0.25,
     idleGapSeconds = 0.6,
     spamDebounceSeconds = 0.40,
 }
@@ -541,15 +542,73 @@ local function AnalyzeShamanTotemTelemetry(fight, summary)
     summary.totemClipCount = clipCount
 end
 
+local function ReconstructShadowResourcePool(fight, summary)
+    local events = fight.events or {}
+    local pType = summary.primaryPowerType or 0
+    local maxPool = 100
+    for i = 1, #(fight.samples or {}) do
+        if (fight.samples[i].max or 0) > 0 then
+            maxPool = fight.samples[i].max
+            break
+        end
+    end
+
+    local estPool = (pType == 1) and 15 or maxPool
+    if fight.samples and fight.samples[1] and not fight.samples[1].isSecret then
+        estPool = fight.samples[1].value or estPool
+    end
+
+    local lastT = 0
+    for i = 1, #events do
+        local ev = events[i]
+        if not ev.isSyntheticEvent then
+            local dt = max(0, (ev.t or 0) - lastT)
+            lastT = ev.t or lastT
+
+            if pType == 3 then
+                estPool = min(maxPool, estPool + (dt * 10.0))
+            elseif pType == 0 then
+                estPool = min(maxPool, estPool + (dt * maxPool * 0.025))
+            elseif pType == 1 then
+                estPool = min(maxPool, estPool + (dt * 2.5))
+            end
+
+            if ev.outcome == "FAILED_RESOURCE" and (ev.spellCost or 0) > 0 then
+                estPool = min(estPool, max(0, ev.spellCost - 1))
+                ev.estimatedPowerBefore = floor(estPool + 0.5)
+            elseif ev.outcome == "SUCCEEDED" then
+                local cost = ev.spellCost or 0
+                if cost > 0 and estPool < cost then
+                    estPool = cost
+                end
+                ev.estimatedPowerBefore = floor(estPool + 0.5)
+                estPool = max(0, estPool - cost)
+                ev.estimatedPowerAfter = floor(estPool + 0.5)
+            else
+                ev.estimatedPowerBefore = floor(estPool + 0.5)
+            end
+        end
+    end
+end
+
 local function AnalyzeCastTempoAndIdleGaps(fight, summary, thresholds)
     local dur = max(0.5, fight.duration or 0.5)
-    local idleGrace = thresholds.idleGapSeconds or DEFAULT_THRESHOLDS.idleGapSeconds
+    local reactionBuf = (thresholds and thresholds.reactionBufferSeconds)
+        or DEFAULT_THRESHOLDS.reactionBufferSeconds
+    local idleGrace = (thresholds and thresholds.idleGapSeconds)
+        or DEFAULT_THRESHOLDS.idleGapSeconds
     local casts = {}
+
+    summary.preCastCount = 0
+    summary.bufferedDelayCount = 0
 
     for i = 1, #fight.events do
         local ev = fight.events[i]
         if not ev.isSyntheticEvent and ev.outcome == "SUCCEEDED" then
             tinsert(casts, ev)
+            if ev.isPreCast then
+                summary.preCastCount = summary.preCastCount + 1
+            end
         end
     end
 
@@ -566,16 +625,23 @@ local function AnalyzeCastTempoAndIdleGaps(fight, summary, thresholds)
         return
     end
 
-    -- Merge active GCD/cast intervals to compute true active uptime without double-counting off-GCD macros
     local mergedActive = 0
     local curStart = casts[1].t or 0
-    local curEnd = min(dur, curStart + max(1.5, casts[1].castTime or 0))
+    local firstBusy = max(1.5, casts[1].castTime or 0)
+    if casts[1].finishTime and casts[1].finishTime > curStart then
+        firstBusy = max(1.5, casts[1].finishTime - curStart)
+    end
+    local curEnd = min(dur, curStart + firstBusy)
 
     for i = 2, castCount do
         local ev = casts[i]
         local evStart = ev.t or 0
-        local evEnd = min(dur, evStart + max(1.5, ev.castTime or 0))
-        if evStart <= curEnd then
+        local busyDur = max(1.5, ev.castTime or 0)
+        if ev.finishTime and ev.finishTime > evStart then
+            busyDur = max(1.5, ev.finishTime - evStart)
+        end
+        local evEnd = min(dur, evStart + busyDur)
+        if evStart <= (curEnd + reactionBuf) then
             if evEnd > curEnd then
                 curEnd = evEnd
             end
@@ -588,30 +654,47 @@ local function AnalyzeCastTempoAndIdleGaps(fight, summary, thresholds)
     mergedActive = mergedActive + max(0, curEnd - curStart)
     summary.activeUptimePct = floor(max(0, min(100, (mergedActive / dur) * 100.0)) + 0.5)
 
-    -- Flag dead-time idle gaps between consecutive player casts
+    -- 3-Tier Gap Classification:
+    --   Tier 1: pre-cast queued OR netGap <= reactionBufferSeconds -> SEAMLESS (human buffer absorbed)
+    --   Tier 2: reactionBufferSeconds < netGap < (reactionBufferSeconds + idleGrace) -> BUFFERED (minor hesitation, unpenalized)
+    --   Tier 3: netGap >= (reactionBufferSeconds + idleGrace) -> IDLE (true IDLE_GAP, penalized)
     local syntheticIdles = {}
     for i = 1, castCount - 1 do
         local prevEv = casts[i]
         local nextEv = casts[i + 1]
+        local prevStart = prevEv.t or 0
         local expectedBusy = max(1.5, prevEv.castTime or 0)
-        local busyEnd = (prevEv.t or 0) + expectedBusy
-        local rawGap = max(0, (nextEv.t or 0) - (prevEv.t or 0))
-        local idleTime = (nextEv.t or 0) - busyEnd
+        if prevEv.finishTime and prevEv.finishTime > prevStart then
+            expectedBusy = max(1.5, prevEv.finishTime - prevStart)
+        end
+        local busyEnd = prevStart + expectedBusy
+        local rawGap = max(0, (nextEv.t or 0) - prevStart)
+        local netGap = (nextEv.t or 0) - busyEnd
 
-        if idleTime >= idleGrace then
+        if nextEv.isPreCast or netGap <= reactionBuf then
+            nextEv.gapTier = "SEAMLESS"
+            nextEv.netDelay = max(0, netGap)
+        elseif netGap < (reactionBuf + idleGrace) then
+            nextEv.gapTier = "BUFFERED"
+            nextEv.netDelay = netGap
+            summary.bufferedDelayCount = summary.bufferedDelayCount + 1
+        else
+            nextEv.gapTier = "IDLE"
+            nextEv.netDelay = netGap
+            local excessIdle = max(0.1, netGap - reactionBuf)
             summary.idleGapCount = summary.idleGapCount + 1
-            summary.totalIdleSeconds = summary.totalIdleSeconds + idleTime
-            local weight = max(0.6, min(2.5, idleTime / max(0.5, idleGrace)))
+            summary.totalIdleSeconds = summary.totalIdleSeconds + excessIdle
+            local weight = max(0.6, min(2.5, excessIdle / max(0.5, idleGrace)))
             summary.weightedIdleMistakes = summary.weightedIdleMistakes + weight
 
             tinsert(summary.idleSegments, {
-                startTime = busyEnd,
-                endTime = nextEv.t or busyEnd,
-                duration = idleTime,
+                startTime = busyEnd + reactionBuf,
+                endTime = nextEv.t or (busyEnd + reactionBuf),
+                duration = excessIdle,
             })
 
             tinsert(syntheticIdles, {
-                t = busyEnd,
+                t = busyEnd + reactionBuf,
                 spellID = 0,
                 spellName = "Idle GCD Gap",
                 spellIcon = nil,
@@ -625,13 +708,13 @@ local function AnalyzeCastTempoAndIdleGaps(fight, summary, thresholds)
                 spellCost = 0,
                 burstSize = 1,
                 pressCount = 1,
-                idleSeconds = idleTime,
+                idleSeconds = excessIdle,
                 rawGapSeconds = rawGap,
                 verdict = VERDICTS.IDLE_GAP,
                 note = format(
-                    "Idle gap: %.1fs dead time (%.1fs between %s -> %s)",
-                    idleTime,
-                    rawGap,
+                    "Idle gap: %.1fs dead time past %.2fs reaction buffer (%s -> %s)",
+                    excessIdle,
+                    reactionBuf,
                     prevEv.spellName or "cast",
                     nextEv.spellName or "cast"
                 ),
@@ -674,6 +757,8 @@ function Analyzer:AnalyzeFight(fight, customThresholds)
             or DEFAULT_THRESHOLDS.hoardMultiplier,
         hoardHoldSeconds = (customThresholds and customThresholds.hoardHoldSeconds)
             or DEFAULT_THRESHOLDS.hoardHoldSeconds,
+        reactionBufferSeconds = (customThresholds and customThresholds.reactionBufferSeconds)
+            or DEFAULT_THRESHOLDS.reactionBufferSeconds,
         idleGapSeconds = (customThresholds and customThresholds.idleGapSeconds)
             or DEFAULT_THRESHOLDS.idleGapSeconds,
         spamDebounceSeconds = (customThresholds and customThresholds.spamDebounceSeconds)
@@ -955,6 +1040,7 @@ function Analyzer:AnalyzeFight(fight, customThresholds)
 
     AnalyzeHunterPetTelemetry(fight, summary)
     AnalyzeShamanTotemTelemetry(fight, summary)
+    ReconstructShadowResourcePool(fight, summary)
     AnalyzeCastTempoAndIdleGaps(fight, summary, thresholds)
 
     local totalSteps = summary.efficientCount

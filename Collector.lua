@@ -163,6 +163,8 @@ local currentFight = nil
 local activeBurst = nil
 local castGuidIndex = {}
 local lastStarvedBySpell = {}
+local activeCastEnd = 0
+local activeCastGUID = nil
 local lastSampleTime = 0
 local lastSamplePower = -1
 local lastSecSampleTime = 0
@@ -554,6 +556,9 @@ local function BuildEventRecord(entry, outcome, burstSize, fallbackNotes)
         powerIsSecret = entry.powerIsSecret and true or false,
         spellCost = cost,
         castTime = entry.castTime or 0,
+        finishTime = entry.finishTime and (entry.finishTime - currentFight.startTime) or nil,
+        isPreCast = entry.isPreCast and true or false,
+        preCastLead = entry.preCastLead or 0,
         druidForm = entry.druidForm,
         secondaryType = entry.secondaryType,
         secondaryBefore = entry.secondaryBefore,
@@ -678,8 +683,19 @@ local function AppendToBurst(now, spellID, castGUID)
     local castTimeSec = max(0, SafeNumber(rawCastTime, 0) / 1000.0)
     local safeCastGUID = SafeString(castGUID, nil)
 
+    -- Detect Spell-Queue / Pre-Cast: player pressed next spell inside the spell queue window before active cast finished
+    local isPreCast = false
+    local preCastLead = 0
+    if activeCastEnd > now and (activeCastEnd - now) <= 0.65 and safeCastGUID ~= activeCastGUID then
+        isPreCast = true
+        preCastLead = activeCastEnd - now
+    end
+
     local entry = {
         sentTime = now,
+        finishTime = nil,
+        isPreCast = isPreCast,
+        preCastLead = preCastLead,
         spellID = spellID,
         spellName = name or ("Spell #" .. tostring(spellID)),
         spellIcon = icon,
@@ -698,6 +714,11 @@ local function AppendToBurst(now, spellID, castGUID)
         offCD = IsSpellOffCooldown(spellID),
         state = "PENDING",
     }
+
+    if castTimeSec > 0 then
+        activeCastEnd = now + castTimeSec
+        activeCastGUID = safeCastGUID
+    end
 
     tinsert(activeBurst.entries, entry)
     if safeCastGUID then
@@ -756,11 +777,17 @@ local function OnSpellcastSucceeded(unit, castGUID, spellID)
     local entry = safeCastGUID and castGuidIndex[safeCastGUID]
     if entry then
         entry.state = "SUCCEEDED"
+        entry.finishTime = now
+        if safeCastGUID == activeCastGUID then
+            activeCastEnd = now
+            activeCastGUID = nil
+        end
     elseif safeSpellID and IsSpellUnlocked(safeSpellID) then
         AppendToBurst(now, safeSpellID, safeCastGUID)
         local latest = activeBurst.entries[#activeBurst.entries]
         if latest then
             latest.state = "SUCCEEDED"
+            latest.finishTime = now
         end
     end
 
@@ -775,6 +802,10 @@ local function OnSpellcastFailed(unit, castGUID)
     local entry = safeCastGUID and castGuidIndex[safeCastGUID]
     if entry and entry.state == "PENDING" then
         entry.state = "FAILED_OTHER"
+        if safeCastGUID == activeCastGUID then
+            activeCastEnd = 0
+            activeCastGUID = nil
+        end
     end
 end
 
@@ -948,6 +979,8 @@ function Collector:StartCombat(meta)
         score = nil,
     }
 
+    activeCastEnd = 0
+    activeCastGUID = nil
     isRecording = true
 
 

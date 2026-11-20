@@ -27,12 +27,16 @@ NS.UI = UI
 
 local BACKDROP_TEMPLATE = BackdropTemplateMixin and "BackdropTemplate" or nil
 
-local WINDOW_WIDTH = 856
-local WINDOW_HEIGHT = 524
+local DEFAULT_WINDOW_WIDTH = 856
+local DEFAULT_WINDOW_HEIGHT = 524
+local MIN_WINDOW_WIDTH = 760
+local MAX_WINDOW_WIDTH = 1440
+local MIN_WINDOW_HEIGHT = 430
+local MAX_WINDOW_HEIGHT = 980
 local BAND1_HEIGHT = 32
-local BAND2_HEIGHT = 198
+local BASE_BAND2_HEIGHT = 198
 local LOG_ROW_HEIGHT = 22
-local VISIBLE_LOG_ROWS = 7
+local DEFAULT_VISIBLE_LOG_ROWS = 7
 local CURVE_SLICES = 150
 local MINIMAP_RIM_PADDING = 6
 local DEFAULT_MINIMAP_ANGLE = 220
@@ -560,6 +564,7 @@ local function SyncSettingsPopover()
     isSyncingSettings = true
     settingsPopover.multSlider:SetDisplayValue(db.thresholds.hoardMultiplier or 2.0)
     settingsPopover.holdSlider:SetDisplayValue(db.thresholds.hoardHoldSeconds or 1.0)
+    settingsPopover.bufferSlider:SetDisplayValue(db.thresholds.reactionBufferSeconds or 0.25)
     settingsPopover.idleSlider:SetDisplayValue(db.thresholds.idleGapSeconds or 0.6)
     settingsPopover.autoShowCheck:SetCheckedState(db.autoShowAfterCombat == true)
     settingsPopover.fadeSlider:SetDisplayValue(db.autoFadeSeconds or DEFAULT_AUTO_FADE_SECONDS)
@@ -574,7 +579,7 @@ end
 local function ToggleSettingsPopover(anchor)
     if not settingsPopover then
         local pop = CreateFrame("Frame", nil, mainFrame, BACKDROP_TEMPLATE)
-        pop:SetSize(264, 480)
+        pop:SetSize(264, 526)
         pop:SetFrameStrata("FULLSCREEN_DIALOG")
         pop:EnableMouse(true)
         ApplyPanelBackdrop(pop, 0.98, 0.34, 0.66, 0.94, 1.0)
@@ -633,6 +638,24 @@ local function ToggleSettingsPopover(anchor)
         holdSlider:SetPoint("TOPLEFT", multSlider, "BOTTOMLEFT", 0, -8)
         pop.holdSlider = holdSlider
 
+        local bufferSlider = CreateCompactSlider(
+            pop,
+            238,
+            "Human Reaction Buffer",
+            0.0,
+            1.5,
+            0.05,
+            "%.2fs",
+            function(val)
+                if NS.Addon and NS.Addon.db then
+                    NS.Addon.db.thresholds.reactionBufferSeconds = val
+                    NS.Addon:ReanalyzeAllFights()
+                end
+            end
+        )
+        bufferSlider:SetPoint("TOPLEFT", holdSlider, "BOTTOMLEFT", 0, -8)
+        pop.bufferSlider = bufferSlider
+
         local idleSlider = CreateCompactSlider(
             pop,
             238,
@@ -648,7 +671,7 @@ local function ToggleSettingsPopover(anchor)
                 end
             end
         )
-        idleSlider:SetPoint("TOPLEFT", holdSlider, "BOTTOMLEFT", 0, -8)
+        idleSlider:SetPoint("TOPLEFT", bufferSlider, "BOTTOMLEFT", 0, -8)
         pop.idleSlider = idleSlider
 
         local divider = pop:CreateTexture(nil, "ARTWORK")
@@ -773,6 +796,7 @@ local function ToggleSettingsPopover(anchor)
                 local defs = NS.Addon.DEFAULT_DB
                 NS.Addon.db.thresholds.hoardMultiplier = defs and defs.thresholds.hoardMultiplier or 2.0
                 NS.Addon.db.thresholds.hoardHoldSeconds = defs and defs.thresholds.hoardHoldSeconds or 1.0
+                NS.Addon.db.thresholds.reactionBufferSeconds = defs and defs.thresholds.reactionBufferSeconds or 0.25
                 NS.Addon.db.thresholds.idleGapSeconds = defs and defs.thresholds.idleGapSeconds or 0.6
                 NS.Addon.db.showPostCombatBanner = true
                 NS.Addon.db.autoShowAfterCombat = false
@@ -1840,17 +1864,32 @@ local function RenderBand2(fight)
     end
 end
 
+local function GetVisibleLogRowCount()
+    if mainFrame and mainFrame.band3 and mainFrame.band3.clipFrame then
+        local h = mainFrame.band3.clipFrame:GetHeight() or 0
+        if h > LOG_ROW_HEIGHT then
+            return max(4, floor(h / LOG_ROW_HEIGHT))
+        end
+    end
+    return DEFAULT_VISIBLE_LOG_ROWS
+end
+
 local function RenderBand3(fight)
     local band3 = mainFrame.band3
     local scrollFrame = band3.scrollFrame
     local totalRows = #filteredEvents
+    local visRows = GetVisibleLogRowCount()
 
-    band3.content:SetHeight(max(VISIBLE_LOG_ROWS * LOG_ROW_HEIGHT, totalRows * LOG_ROW_HEIGHT))
+    band3.content:SetHeight(max(visRows * LOG_ROW_HEIGHT, totalRows * LOG_ROW_HEIGHT))
 
     local offset = scrollFrame:GetVerticalScroll() or 0
     local firstIndex = floor(offset / LOG_ROW_HEIGHT) + 1
 
-    for r = 1, VISIBLE_LOG_ROWS + 1 do
+    for i = 1, #logRowPool do
+        logRowPool[i]:Hide()
+    end
+
+    for r = 1, visRows + 1 do
         local row = logRowPool[r]
         if not row then
             row = CreateFrame("Button", nil, band3.clipFrame)
@@ -1948,6 +1987,9 @@ local function RenderBand3(fight)
             end
 
             local badges = ""
+            if ev.isPreCast then
+                badges = badges .. " |cff45e0a2[Q]|r"
+            end
             if ev.isPowershift then
                 badges = badges .. " |cff33e6c2[PS]|r"
             end
@@ -1965,7 +2007,13 @@ local function RenderBand3(fight)
             elseif ev.isSyntheticOvercap then
                 resStr = format("%d/%d", ev.powerBefore or 0, ev.powerMax or 100)
             elseif ev.powerIsSecret then
-                if (ev.spellCost or 0) > 0 then
+                if ev.estimatedPowerBefore ~= nil then
+                    if (ev.spellCost or 0) > 0 then
+                        resStr = format("|cff88929e~%d|r (-%d)", ev.estimatedPowerBefore, ev.spellCost)
+                    else
+                        resStr = format("|cff88929e~%d|r", ev.estimatedPowerBefore)
+                    end
+                elseif (ev.spellCost or 0) > 0 then
                     resStr = format("|cff88929eSecret|r (-%d)", ev.spellCost)
                 else
                     resStr = "|cff88929eSecret|r"
@@ -2294,6 +2342,55 @@ local function SaveMainWindowPosition(frame)
     end
 end
 
+local function SaveMainWindowSize(frame)
+    if not frame or not NS.Addon or not NS.Addon.db then
+        return
+    end
+    local w = floor((frame:GetWidth() or DEFAULT_WINDOW_WIDTH) + 0.5)
+    local h = floor((frame:GetHeight() or DEFAULT_WINDOW_HEIGHT) + 0.5)
+    NS.Addon.db.windowSize = {
+        w = max(MIN_WINDOW_WIDTH, min(MAX_WINDOW_WIDTH, w)),
+        h = max(MIN_WINDOW_HEIGHT, min(MAX_WINDOW_HEIGHT, h)),
+    }
+end
+
+local function ApplyMainWindowResponsiveLayout(frame)
+    if not frame then
+        return
+    end
+    local w = frame:GetWidth() or DEFAULT_WINDOW_WIDTH
+    local h = frame:GetHeight() or DEFAULT_WINDOW_HEIGHT
+
+    -- Scale Band 2 proportionally when taller, leaving generous room for Band 3 rows
+    local extraH = h - DEFAULT_WINDOW_HEIGHT
+    local b2H = max(150, min(340, floor(BASE_BAND2_HEIGHT + (extraH * 0.35) + 0.5)))
+    if frame.band2 then
+        frame.band2:SetHeight(b2H)
+    end
+    if frame.band3 and frame.band3.content then
+        frame.band3.content:SetWidth(max(400, w - 52))
+    end
+end
+
+local function RestoreMainWindowSize(frame)
+    if not frame then
+        return
+    end
+    local sz = NS.Addon and NS.Addon.db and NS.Addon.db.windowSize
+    local w = DEFAULT_WINDOW_WIDTH
+    local h = DEFAULT_WINDOW_HEIGHT
+    if type(sz) == "table" then
+        if type(sz.w) == "number" then
+            w = max(MIN_WINDOW_WIDTH, min(MAX_WINDOW_WIDTH, sz.w))
+        end
+        if type(sz.h) == "number" then
+            h = max(MIN_WINDOW_HEIGHT, min(MAX_WINDOW_HEIGHT, sz.h))
+        end
+    end
+    frame:SetSize(w, h)
+    ApplyMainWindowResponsiveLayout(frame)
+end
+
 local function RestoreMainWindowPosition(frame)
     if not frame then
         return
@@ -2310,10 +2407,15 @@ end
 function UI:ResetWindowPosition()
     if NS.Addon and NS.Addon.db then
         NS.Addon.db.windowPos = nil
+        NS.Addon.db.windowSize = nil
         NS.Addon.db.pillPos = nil
     end
     if mainFrame then
+        RestoreMainWindowSize(mainFrame)
         RestoreMainWindowPosition(mainFrame)
+        if mainFrame:IsShown() then
+            self:Refresh()
+        end
     end
     if pillFrame then
         RestorePillPosition(pillFrame)
@@ -2355,11 +2457,28 @@ local function EnsureMainFrame()
     end
 
     local f = CreateFrame("Frame", "CombatTelemetryEfficiencyMainFrame", UIParent, BACKDROP_TEMPLATE)
-    f:SetSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+    RestoreMainWindowSize(f)
     RestoreMainWindowPosition(f)
     f:SetFrameStrata("DIALOG")
     f:SetMovable(true)
+    f:SetResizable(true)
+    if f.SetResizeBounds then
+        f:SetResizeBounds(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT, MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT)
+    else
+        if f.SetMinResize then
+            f:SetMinResize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+        end
+        if f.SetMaxResize then
+            f:SetMaxResize(MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT)
+        end
+    end
     f:SetClampedToScreen(true)
+    f:SetScript("OnSizeChanged", function(self)
+        ApplyMainWindowResponsiveLayout(self)
+        if self:IsShown() then
+            UI:Refresh()
+        end
+    end)
     f:EnableMouse(true)
     f:RegisterForDrag("LeftButton")
     f:SetScript("OnMouseDown", function()
@@ -2699,7 +2818,7 @@ local function EnsureMainFrame()
     local band2 = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
     band2:SetPoint("TOPLEFT", band1, "BOTTOMLEFT", 0, -6)
     band2:SetPoint("TOPRIGHT", band1, "BOTTOMRIGHT", 0, -6)
-    band2:SetHeight(BAND2_HEIGHT)
+    band2:SetHeight(BASE_BAND2_HEIGHT)
     ApplyPanelBackdrop(band2, 0.92, 0.22, 0.25, 0.30, 1.0)
     f.band2 = band2
 
@@ -2831,7 +2950,7 @@ local function EnsureMainFrame()
     band3.scrollFrame = scrollFrame
 
     local content = CreateFrame("Frame", nil, scrollFrame)
-    content:SetSize(WINDOW_WIDTH - 52, VISIBLE_LOG_ROWS * LOG_ROW_HEIGHT)
+    content:SetSize(DEFAULT_WINDOW_WIDTH - 52, DEFAULT_VISIBLE_LOG_ROWS * LOG_ROW_HEIGHT)
     scrollFrame:SetScrollChild(content)
     band3.content = content
 
@@ -2842,12 +2961,62 @@ local function EnsureMainFrame()
         end
     end)
 
+    -- Bottom-right resize grip handle (drag to resize main CTE window)
+    local resizeGrip = CreateFrame("Button", nil, f)
+    resizeGrip:SetSize(18, 18)
+    resizeGrip:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -3, 3)
+    resizeGrip:SetFrameLevel(f:GetFrameLevel() + 10)
+    resizeGrip:EnableMouse(true)
+
+    local gripTex = resizeGrip:CreateTexture(nil, "OVERLAY")
+    gripTex:SetAllPoints()
+    gripTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+
+    local gripHl = resizeGrip:CreateTexture(nil, "HIGHLIGHT")
+    gripHl:SetAllPoints()
+    gripHl:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
+
+    resizeGrip:SetScript("OnMouseDown", function(_, button)
+        if button == "LeftButton" then
+            CancelAutoFade()
+            gripTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
+            f:StartSizing("BOTTOMRIGHT")
+        end
+    end)
+    resizeGrip:SetScript("OnMouseUp", function()
+        f:StopMovingOrSizing()
+        gripTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+        SaveMainWindowSize(f)
+        SaveMainWindowPosition(f)
+        ApplyMainWindowResponsiveLayout(f)
+        UI:Refresh()
+    end)
+    resizeGrip:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(resizeGrip, "ANCHOR_TOPLEFT")
+        GameTooltip:SetText("Drag to Resize Window", 1.0, 0.82, 0.25)
+        GameTooltip:AddLine("Double-click to reset default size", 0.75, 0.80, 0.86)
+        GameTooltip:Show()
+    end)
+    resizeGrip:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+    resizeGrip:SetScript("OnDoubleClick", function()
+        if NS.Addon and NS.Addon.db then
+            NS.Addon.db.windowSize = nil
+        end
+        RestoreMainWindowSize(f)
+        UI:Refresh()
+    end)
+    f.resizeGrip = resizeGrip
+
+    ApplyMainWindowResponsiveLayout(f)
     mainFrame = f
     return f
 end
 
 function UI:Show()
     local f = EnsureMainFrame()
+    RestoreMainWindowSize(f)
     RestoreMainWindowPosition(f)
     CancelAutoFade()
     f:SetAlpha(1.0)
@@ -3063,7 +3232,7 @@ end
 
 
 ------------------------------------------------------------------------
--- Side-by-Side Multi-Fight Comparison Summary Window (v0.3.0)
+-- Side-by-Side Multi-Fight Comparison Summary Window (v0.3.1 — Gold/Amber & Emerald Theme)
 ------------------------------------------------------------------------
 
 local COMPARE_ROW_HEIGHT = 24
@@ -3084,14 +3253,16 @@ local function EnsureCompareFrame()
     f:RegisterForDrag("LeftButton")
     f:SetScript("OnDragStart", f.StartMoving)
     f:SetScript("OnDragStop", f.StopMovingOrSizing)
-    ApplyPanelBackdrop(f, 0.97, 0.32, 0.64, 0.92, 1.0)
+    -- Warm charcoal-espresso backdrop with rich Gold/Amber border (distinct from main window's blue)
+    ApplyPanelBackdrop(f, 0.97, 0.88, 0.62, 0.20, 1.0)
+    f:SetBackdropColor(0.11, 0.09, 0.08, 0.97)
     f:Hide()
 
     tinsert(UISpecialFrames, "CombatTelemetryEfficiencyCompareFrame")
 
     local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     title:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -12)
-    title:SetText("|cff5cc8ffCTE Multi-Fight Comparison Summary|r")
+    title:SetText("|cffffc94dCTE Multi-Fight Comparison Summary|r")
 
     local modeBadge = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     modeBadge:SetPoint("LEFT", title, "RIGHT", 10, 0)
@@ -3114,12 +3285,12 @@ local function EnsureCompareFrame()
         end
     end)
 
-    -- 4 Aggregate KPI Summary Cards
+    -- 4 Aggregate KPI Summary Cards with distinct accent borders (Gold, Emerald, Violet, Coral)
     local cardSpecs = {
-        { key = "avgScore",  label = "Avg / Best Score" },
-        { key = "avgUptime", label = "Avg GCD Uptime & CPM" },
-        { key = "latestVs",  label = "Latest (#1) vs Avg" },
-        { key = "mistakes",  label = "Total Mistakes Across Fights" },
+        { key = "avgScore",  label = "Avg / Best Score",            border = { 0.88, 0.66, 0.22 }, titleHex = "|cffffcf5c" },
+        { key = "avgUptime", label = "Avg GCD Uptime & CPM",        border = { 0.22, 0.78, 0.56 }, titleHex = "|cff45e0a2" },
+        { key = "latestVs",  label = "Latest (#1) vs Avg",          border = { 0.76, 0.44, 0.92 }, titleHex = "|cffd28aff" },
+        { key = "mistakes",  label = "Total Mistakes Across Fights",border = { 0.92, 0.44, 0.28 }, titleHex = "|cffff8c66" },
     }
     f.cards = {}
     local cardGap = 8
@@ -3134,11 +3305,12 @@ local function EnsureCompareFrame()
         else
             card:SetPoint("LEFT", f.cards[idx - 1], "RIGHT", cardGap, 0)
         end
-        ApplyPanelBackdrop(card, 0.94, 0.22, 0.26, 0.32, 1.0)
+        ApplyPanelBackdrop(card, 0.95, spec.border[1], spec.border[2], spec.border[3], 0.90)
+        card:SetBackdropColor(0.14, 0.12, 0.10, 0.95)
 
         local lbl = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         lbl:SetPoint("TOPLEFT", card, "TOPLEFT", 8, -7)
-        lbl:SetText("|cff88929e" .. spec.label .. "|r")
+        lbl:SetText(spec.titleHex .. spec.label .. "|r")
 
         local val = card:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         val:SetPoint("TOPLEFT", card, "TOPLEFT", 8, -22)
@@ -3159,13 +3331,14 @@ local function EnsureCompareFrame()
     local tableBox = CreateFrame("Frame", nil, f, BACKDROP_TEMPLATE)
     tableBox:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -100)
     tableBox:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 12)
-    ApplyPanelBackdrop(tableBox, 0.95, 0.22, 0.25, 0.30, 1.0)
+    ApplyPanelBackdrop(tableBox, 0.95, 0.42, 0.33, 0.20, 1.0)
+    tableBox:SetBackdropColor(0.10, 0.09, 0.08, 0.95)
 
     local hdrBg = tableBox:CreateTexture(nil, "ARTWORK")
     hdrBg:SetHeight(22)
     hdrBg:SetPoint("TOPLEFT", tableBox, "TOPLEFT", 1, -1)
     hdrBg:SetPoint("TOPRIGHT", tableBox, "TOPRIGHT", -1, -1)
-    hdrBg:SetColorTexture(0.13, 0.15, 0.19, 1.0)
+    hdrBg:SetColorTexture(0.20, 0.16, 0.11, 1.0)
 
     local cols = {
         { text = "#",          x = 8,   w = 34,  justify = "LEFT" },
@@ -3189,7 +3362,7 @@ local function EnsureCompareFrame()
         h:SetPoint("LEFT", hdrBg, "LEFT", c.x, 0)
         h:SetWidth(c.w)
         h:SetJustifyH(c.justify)
-        h:SetText("|cff9aa5b4" .. c.text .. "|r")
+        h:SetText("|cffe6c88a" .. c.text .. "|r")
     end
 
     local scrollFrame = CreateFrame("ScrollFrame", "CombatTelemetryEfficiencyCompareScroll", tableBox, "UIPanelScrollFrameTemplate")
@@ -3220,9 +3393,9 @@ function UI:RefreshCompareWindow()
     local cap = (NS.Addon and NS.Addon.db and NS.Addon.db.maxFights) or 10
 
     if isMulti then
-        f.modeBadge:SetText(format("|cff2ed16bMulti-Fight Mode ON|r |cff88929e(%d/%d stored — click any row to inspect)|r", #fights, cap))
+        f.modeBadge:SetText(format("|cff45e0a2Multi-Fight Mode ON|r |cffb8a890(%d/%d stored — click any row to inspect)|r", #fights, cap))
     else
-        f.modeBadge:SetText("|cfff5ad24Single-Fight Mode|r |cff88929e(enable Multi-Fight in Settings or /cte mode multi)|r")
+        f.modeBadge:SetText("|cffffb347Single-Fight Mode|r |cffb8a890(enable Multi-Fight in Settings or /cte mode multi)|r")
     end
 
     local cmp = (NS.Analyzer and NS.Analyzer.BuildMultiFightComparison)
@@ -3234,14 +3407,14 @@ function UI:RefreshCompareWindow()
     end
 
     if cmp.fightCount == 0 then
-        f.cards.avgScore.val:SetText("|cff88929e--|r")
-        f.cards.avgScore.sub:SetText("|cff6e7682No stored fights|r")
-        f.cards.avgUptime.val:SetText("|cff88929e--|r")
-        f.cards.avgUptime.sub:SetText("|cff6e7682Enter combat to record|r")
-        f.cards.latestVs.val:SetText("|cff88929e--|r")
-        f.cards.latestVs.sub:SetText("|cff6e7682--|r")
-        f.cards.mistakes.val:SetText("|cff88929e0|r")
-        f.cards.mistakes.sub:SetText("|cff6e7682Early 0 | Late 0 | Idle 0|r")
+        f.cards.avgScore.val:SetText("|cff9e9282--|r")
+        f.cards.avgScore.sub:SetText("|cff7d7265No stored fights|r")
+        f.cards.avgUptime.val:SetText("|cff9e9282--|r")
+        f.cards.avgUptime.sub:SetText("|cff7d7265Enter combat to record|r")
+        f.cards.latestVs.val:SetText("|cff9e9282--|r")
+        f.cards.latestVs.sub:SetText("|cff7d7265--|r")
+        f.cards.mistakes.val:SetText("|cff9e92820|r")
+        f.cards.mistakes.sub:SetText("|cff7d7265Early 0 | Late 0 | Idle 0|r")
         f.emptyHint:SetText("No recorded fights yet. Enable Multi-Fight mode and complete 2+ fights to compare.")
         f.emptyHint:Show()
         return
@@ -3249,24 +3422,24 @@ function UI:RefreshCompareWindow()
 
     f.emptyHint:Hide()
 
-    local avgHex = (cmp.avgScore >= 88 and "|cff2ed16b") or (cmp.avgScore >= 70 and "|cfff5ad24") or "|cfff04047"
-    f.cards.avgScore.val:SetText(format("%s%.1f%%|r  |cff88929e(Best %d%%)|r", avgHex, cmp.avgScore, cmp.bestScore))
-    f.cards.avgScore.sub:SetText(format("|cff88929eLowest: %d%% across %d fight(s)|r", cmp.worstScore, cmp.fightCount))
+    local avgHex = (cmp.avgScore >= 88 and "|cff45e0a2") or (cmp.avgScore >= 70 and "|cffffc94d") or "|cffff5e5e"
+    f.cards.avgScore.val:SetText(format("%s%.1f%%|r  |cffb8a890(Best %d%%)|r", avgHex, cmp.avgScore, cmp.bestScore))
+    f.cards.avgScore.sub:SetText(format("|cff9e9282Lowest: %d%% across %d fight(s)|r", cmp.worstScore, cmp.fightCount))
 
-    f.cards.avgUptime.val:SetText(format("|cff5cc8ff%.0f%%|r  |cffd8e2ee(%.1f CPM)|r", cmp.avgUptimePct, cmp.avgCpm))
-    f.cards.avgUptime.sub:SetText(format("|cff88929eAvg Duration: %.1fs|r", cmp.avgDuration))
+    f.cards.avgUptime.val:SetText(format("|cff45e0a2%.0f%%|r  |cfff2e6d0(%.1f CPM)|r", cmp.avgUptimePct, cmp.avgCpm))
+    f.cards.avgUptime.sub:SetText(format("|cff9e9282Avg Duration: %.1fs|r", cmp.avgDuration))
 
     local dScore = cmp.scoreDeltaLatestVsAvg or 0
-    local dHex = (dScore >= 0.5 and "|cff2ed16b") or (dScore <= -0.5 and "|cfff04047") or "|cffd8e2ee"
+    local dHex = (dScore >= 0.5 and "|cff45e0a2") or (dScore <= -0.5 and "|cffff5e5e") or "|cfff2e6d0"
     local dUp = cmp.uptimeDeltaLatestVsAvg or 0
-    local uHex = (dUp >= 0.5 and "|cff2ed16b") or (dUp <= -0.5 and "|cfff04047") or "|cff88929e"
-    f.cards.latestVs.val:SetText(format("%s%+.1f%%|r  |cff88929eScore|r", dHex, dScore))
-    f.cards.latestVs.sub:SetText(format("%s%+.0f%% Uptime|r |cff88929evs session avg|r", uHex, dUp))
+    local uHex = (dUp >= 0.5 and "|cff45e0a2") or (dUp <= -0.5 and "|cffff5e5e") or "|cff9e9282"
+    f.cards.latestVs.val:SetText(format("%s%+.1f%%|r  |cffb8a890Score|r", dHex, dScore))
+    f.cards.latestVs.sub:SetText(format("%s%+.0f%% Uptime|r |cff9e9282vs session avg|r", uHex, dUp))
 
     local totalMistakes = cmp.totalEarly + cmp.totalLate + cmp.totalOvercap + cmp.totalIdle
-    f.cards.mistakes.val:SetText(format("|cfff5ad24%d|r  |cff88929e(%.1fs dead)|r", totalMistakes, cmp.totalIdleSeconds))
+    f.cards.mistakes.val:SetText(format("|cffffb347%d|r  |cffb8a890(%.1fs dead)|r", totalMistakes, cmp.totalIdleSeconds))
     f.cards.mistakes.sub:SetText(format(
-        "|cfff04047E:%d|r |cfff5ad24L:%d|r |cffd159ebO:%d|r |cfff28538I:%d|r",
+        "|cffff5e5eE:%d|r |cffffc94dL:%d|r |cffd28affO:%d|r |cffff8c66I:%d|r",
         cmp.totalEarly, cmp.totalLate, cmp.totalOvercap, cmp.totalIdle
     ))
 
@@ -3287,7 +3460,7 @@ function UI:RefreshCompareWindow()
 
             local hl = row:CreateTexture(nil, "HIGHLIGHT")
             hl:SetAllPoints()
-            hl:SetColorTexture(0.28, 0.56, 0.88, 0.25)
+            hl:SetColorTexture(0.88, 0.64, 0.20, 0.25)
 
             row.cells = {}
             for cIdx = 1, #f.cols do
@@ -3302,32 +3475,32 @@ function UI:RefreshCompareWindow()
         end
 
         if r.index == selectedFightIndex then
-            row.bg:SetColorTexture(0.20, 0.36, 0.58, 0.45)
+            row.bg:SetColorTexture(0.42, 0.30, 0.12, 0.55)
         elseif i % 2 == 0 then
-            row.bg:SetColorTexture(0.12, 0.14, 0.18, 0.65)
+            row.bg:SetColorTexture(0.16, 0.13, 0.10, 0.65)
         else
-            row.bg:SetColorTexture(0.09, 0.11, 0.14, 0.45)
+            row.bg:SetColorTexture(0.12, 0.10, 0.08, 0.45)
         end
 
-        local sHex = (r.score >= 88 and "|cff2ed16b") or (r.score >= 70 and "|cfff5ad24") or "|cfff04047"
+        local sHex = (r.score >= 88 and "|cff45e0a2") or (r.score >= 70 and "|cffffc94d") or "|cffff5e5e"
         local sd = r.scoreDelta or 0
-        local sdHex = (sd >= 0.5 and "|cff2ed16b") or (sd <= -0.5 and "|cfff04047") or "|cff88929e"
+        local sdHex = (sd >= 0.5 and "|cff45e0a2") or (sd <= -0.5 and "|cffff5e5e") or "|cff9e9282"
         local pinPrefix = r.pinned and "|cffffd100[P]|r " or ""
-        local tagStr = r.isBest and "|cff2ed16bBEST|r"
-            or (r.isWorst and "|cfff04047LOW|r" or (r.index == 1 and "|cff5cc8ffNEW|r" or ""))
+        local tagStr = r.isBest and "|cff45e0a2BEST|r"
+            or (r.isWorst and "|cffff5e5eLOW|r" or (r.index == 1 and "|cffffc94dNEW|r" or ""))
 
-        row.cells[1]:SetText(format("|cff88929e#%d|r", r.index))
+        row.cells[1]:SetText(format("|cffb8a890#%d|r", r.index))
         row.cells[2]:SetText(pinPrefix .. (r.targetName or "Encounter"))
         row.cells[3]:SetText(FormatShortClock(r.duration))
         row.cells[4]:SetText(format("%s%d%%|r", sHex, r.score))
         row.cells[5]:SetText(format("%s%+.1f|r", sdHex, sd))
-        row.cells[6]:SetText(format("|cff5cc8ff%d%%|r", r.uptimePct))
+        row.cells[6]:SetText(format("|cff45e0a2%d%%|r", r.uptimePct))
         row.cells[7]:SetText(format("%.1f", r.cpm))
-        row.cells[8]:SetText(format("|cff2ed16b%d|r", r.efficient))
-        row.cells[9]:SetText(r.early > 0 and format("|cfff04047%d|r", r.early) or "|cff6e76820|r")
-        row.cells[10]:SetText(r.late > 0 and format("|cfff5ad24%d|r", r.late) or "|cff6e76820|r")
-        row.cells[11]:SetText(r.overcap > 0 and format("|cffd159eb%d|r", r.overcap) or "|cff6e76820|r")
-        row.cells[12]:SetText(r.idle > 0 and format("|cfff28538%d|r", r.idle) or "|cff6e76820|r")
+        row.cells[8]:SetText(format("|cff45e0a2%d|r", r.efficient))
+        row.cells[9]:SetText(r.early > 0 and format("|cffff5e5e%d|r", r.early) or "|cff7d72650|r")
+        row.cells[10]:SetText(r.late > 0 and format("|cffffc94d%d|r", r.late) or "|cff7d72650|r")
+        row.cells[11]:SetText(r.overcap > 0 and format("|cffd28aff%d|r", r.overcap) or "|cff7d72650|r")
+        row.cells[12]:SetText(r.idle > 0 and format("|cffff8c66%d|r", r.idle) or "|cff7d72650|r")
         row.cells[13]:SetText(tagStr)
 
         local targetIdx = r.index

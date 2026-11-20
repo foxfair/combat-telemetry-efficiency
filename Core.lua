@@ -55,6 +55,8 @@ local MIN_HOARD_HOLD_SECONDS = 0.0
 local MAX_HOARD_HOLD_SECONDS = 10.0
 local MIN_AUTO_FADE_SECONDS = 3.0
 local MAX_AUTO_FADE_SECONDS = 30.0
+local MIN_REACTION_BUFFER_SECONDS = 0.0
+local MAX_REACTION_BUFFER_SECONDS = 1.5
 local MIN_IDLE_GAP_SECONDS = 0.2
 local MAX_IDLE_GAP_SECONDS = 5.0
 local MAX_STORED_ERRORS = 40
@@ -75,10 +77,12 @@ local DEFAULT_DB = {
         angle = 220,
     },
     windowPos = nil,
+    windowSize = nil,
     pillPos = nil,
     thresholds = {
         hoardMultiplier = 2.0,
         hoardHoldSeconds = 1.0,
+        reactionBufferSeconds = 0.25,
         idleGapSeconds = 0.6,
         spamDebounceSeconds = 0.40,
     },
@@ -516,9 +520,11 @@ function Addon:BuildFightDumpText(fight, arg)
 
     if targetFight.summary and targetFight.summary.activeUptimePct ~= nil then
         tinsert(lines, format(
-            "Tempo: Active GCD Uptime %d%% | %.1f CPM | Idle Gaps: %d (%.1fs dead time)",
+            "Tempo: Active GCD Uptime %d%% | %.1f CPM | Pre-Casts: %d | Buffered Delays: %d | Idle Gaps: %d (%.1fs dead time)",
             targetFight.summary.activeUptimePct or 0,
             targetFight.summary.cpm or 0,
+            targetFight.summary.preCastCount or 0,
+            targetFight.summary.bufferedDelayCount or 0,
             targetFight.summary.idleGapCount or 0,
             targetFight.summary.totalIdleSeconds or 0
         ))
@@ -924,6 +930,39 @@ function Addon:HandleHoldCommand(arg)
     self:PrintRescoreSummary(format("Set hoardHoldSeconds to |cff5cc8ff%.2fs|r.", val))
 end
 
+function Addon:HandleBufferCommand(arg)
+    local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
+    if trimmed == "" then
+        self:Print(format(
+            "Current reactionBufferSeconds: |cff5cc8ff%.2fs|r (human reaction grace after GCD/cast; range %.2f–%.2f, default %.2fs).",
+            self.db.thresholds.reactionBufferSeconds or DEFAULT_DB.thresholds.reactionBufferSeconds,
+            MIN_REACTION_BUFFER_SECONDS,
+            MAX_REACTION_BUFFER_SECONDS,
+            DEFAULT_DB.thresholds.reactionBufferSeconds
+        ))
+        return
+    end
+
+    if trimmed == "default" or trimmed == "reset" then
+        self.db.thresholds.reactionBufferSeconds = DEFAULT_DB.thresholds.reactionBufferSeconds
+        self:PrintRescoreSummary(format("Reset reactionBufferSeconds to |cff5cc8ff%.2fs|r.", self.db.thresholds.reactionBufferSeconds))
+        return
+    end
+
+    local val = tonumber(trimmed)
+    if not val or val < MIN_REACTION_BUFFER_SECONDS or val > MAX_REACTION_BUFFER_SECONDS then
+        self:Print(format(
+            "Invalid reaction buffer. Usage: /cte buffer <%.2f–%.2f> or /cte buffer default",
+            MIN_REACTION_BUFFER_SECONDS,
+            MAX_REACTION_BUFFER_SECONDS
+        ))
+        return
+    end
+
+    self.db.thresholds.reactionBufferSeconds = val
+    self:PrintRescoreSummary(format("Set reactionBufferSeconds to |cff5cc8ff%.2fs|r.", val))
+end
+
 function Addon:HandleIdleCommand(arg)
     local trimmed = lower(match(arg or "", "^%s*(.-)%s*$"))
     if trimmed == "" then
@@ -1187,13 +1226,14 @@ function Addon:HandleSlashCommand(input)
     elseif cmd == "report" or cmd == "share" then
         local ch = (rest ~= "" and rest) or "SELF"
         self:ShareFightReport(nil, ch)
-    elseif cmd == "center" or cmd == "resetpos" then
+    elseif cmd == "center" or cmd == "resetpos" or cmd == "resetsize" then
         self.db.windowPos = nil
+        self.db.windowSize = nil
         self.db.pillPos = nil
         if NS.UI and NS.UI.ResetWindowPosition then
             NS.UI:ResetWindowPosition()
         end
-        self:Print("Reset CTE window and notification pill positions.")
+        self:Print("Reset CTE window position, size, and notification pill position.")
     elseif cmd == "minimap" or cmd == "icon" then
         self.db.minimap.hide = not self.db.minimap.hide
         if NS.UI and NS.UI.UpdateMinimapButton then
@@ -1209,6 +1249,8 @@ function Addon:HandleSlashCommand(input)
         self:HandleHoldCommand(rest)
     elseif cmd == "fade" or cmd == "autofade" then
         self:HandleFadeCommand(rest)
+    elseif cmd == "buffer" or cmd == "grace" or cmd == "reaction" then
+        self:HandleBufferCommand(rest)
     elseif cmd == "idle" or cmd == "gcd" then
         self:HandleIdleCommand(rest)
     elseif cmd == "mode" or cmd == "history" then
@@ -1253,7 +1295,7 @@ function Addon:HandleSlashCommand(input)
             self.db.thresholds.idleGapSeconds or DEFAULT_DB.thresholds.idleGapSeconds
         ))
     else
-        self:Print("Commands: /cte | /cte compare [chat] | /cte mode [single|multi] | /cte maxfights <2-25> | /cte dump [json|chat] [N|all] | /cte errors [chat|clear] | /cte idle <0.2-5.0> | /cte fade <3-30|off> | /cte pin [idx] | /cte del [idx] | /cte report [ch] | /cte boss | /cte clear [all]")
+        self:Print("Commands: /cte | /cte compare [chat] | /cte buffer <0-1.5> | /cte mode [single|multi] | /cte maxfights <2-25> | /cte dump [json|chat] [N|all] | /cte errors [chat|clear] | /cte idle <0.2-5.0> | /cte fade <3-30|off> | /cte pin [idx] | /cte del [idx] | /cte report [ch] | /cte boss | /cte clear [all]")
     end
 end
 
